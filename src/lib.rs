@@ -15,6 +15,7 @@ pub mod named;
 pub mod num;
 pub mod parse;
 pub mod pattern;
+mod raw_simplicity;
 pub mod resolution;
 pub mod source;
 mod template_program;
@@ -81,15 +82,22 @@ impl TemplateAst {
         dependency_map: &DependencyMap,
         unstable_features: &UnstableFeatures,
     ) -> Result<String, DiagnosticManager> {
-        let (program, diagnostics) = DependencyGraph::build_program(
+        let (program, mut diagnostics) = DependencyGraph::build_program(
             source,
             Arc::from(dependency_map.clone()),
             unstable_features,
         );
 
-        let Some(resolved_program) = program else {
+        let Some(mut resolved_program) = program else {
             return Err(diagnostics);
         };
+
+        if let Some(sources) = diagnostics.sources() {
+            if let Err(error) = resolved_program.absolutize_raw_paths(sources) {
+                diagnostics.push(error);
+                return Err(diagnostics);
+            }
+        }
 
         Ok(resolved_program.to_string())
     }

@@ -1,0 +1,8 @@
+simc "*";
+
+#[simplicity(path = "equal32.simpl", entry = "equal32")]
+extern fn raw_equal32(a: u32, b: u32) -> bool;
+
+fn main() {
+    assert!(raw_equal32(witness::A, witness::B));
+}

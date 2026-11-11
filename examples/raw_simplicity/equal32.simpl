@@ -1,0 +1,2 @@
+-- Called from SimplicityHL with two u32 arguments, paired in declaration order.
+equal32 := jet_eq_32 : (2^32 * 2^32) -> 2

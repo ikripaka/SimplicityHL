@@ -36,6 +36,7 @@ impl ChumskyParse for Program {
                             Token::Pub
                                 | Token::Use
                                 | Token::Fn
+                                | Token::Hash
                                 | Token::Type
                                 | Token::Mod
                                 | Token::Enum
@@ -123,20 +124,52 @@ impl ChumskyParse for Function {
             )))
             .labelled("function body");
 
-        visibility
-            .then_ignore(just(Token::Fn))
-            .then(FunctionName::parser())
+        let signature = just(Token::Fn)
+            .ignore_then(FunctionName::parser())
             .then(params)
-            .then(ret)
+            .then(ret);
+        let ordinary = visibility
+            .clone()
+            .then(signature.clone())
             .then(body)
-            .map_with(|((((visibility, name), params), ret), body), e| Self {
+            .map_with(|((visibility, ((name, params), ret)), body), e| Self {
                 visibility,
                 name,
                 params,
                 ret,
-                body,
+                body: crate::parse::FunctionBody::HighLevel(body),
                 span: e.span(),
-            })
+            });
+        let string = select! { Token::StringLiteral(s) => Arc::<str>::from(s) };
+        let attribute = just(Token::Hash)
+            .ignore_then(just(Token::LBracket))
+            .ignore_then(just(Token::Ident("simplicity")))
+            .ignore_then(just(Token::LParen))
+            .ignore_then(just(Token::Ident("path")))
+            .ignore_then(just(Token::Eq))
+            .ignore_then(string)
+            .then_ignore(just(Token::Comma))
+            .then_ignore(just(Token::Ident("entry")))
+            .then_ignore(just(Token::Eq))
+            .then(string)
+            .then_ignore(just(Token::RParen))
+            .then_ignore(just(Token::RBracket));
+        let external = attribute
+            .then(visibility)
+            .then_ignore(just(Token::Extern))
+            .then(signature)
+            .then_ignore(just(Token::Semi))
+            .map_with(
+                |(((path, entry), visibility), ((name, params), ret)), e| Self {
+                    visibility,
+                    name,
+                    params,
+                    ret,
+                    body: crate::parse::FunctionBody::Simplicity { path, entry },
+                    span: e.span(),
+                },
+            );
+        external.or(ordinary)
     }
 }
 

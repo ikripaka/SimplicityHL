@@ -830,6 +830,9 @@ pub enum Error {
     BitStringPow2 {
         len: usize,
     },
+    Simplicity {
+        msg: String,
+    },
     CannotParse {
         msg: String,
     },
@@ -1043,6 +1046,7 @@ impl fmt::Display for Error {
                 f,
                 "Expected a valid bit string length (1, 2, 4, 8, 16, 32, 64, 128, 256), found {len}"
             ),
+            Error::Simplicity { msg } => write!(f, "Raw Simplicity: {msg}"),
             Error::CannotParse{ msg } => write!(
                 f,
                 "Cannot parse: {msg}"

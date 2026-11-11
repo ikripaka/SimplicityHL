@@ -21,6 +21,14 @@ pub trait JetHinter: std::fmt::Debug + Send + Sync {
     /// Clones the `JetHinter` into a boxed trait object.
     fn clone_box(&self) -> Box<dyn JetHinter>;
 
+    /// Parse a raw fragment using this compiler's jet set.
+    fn parse_simplicity(
+        &self,
+        _source: &str,
+    ) -> Result<simplicity::human_encoding::Forest, String> {
+        Err("this jet hinter does not support raw Simplicity parsing".into())
+    }
+
     // The methods below default to `None`, so an implementation written before
     // they were added, or one for a jet set without the SHA-256 context jets,
     // keeps compiling; `raw_hash` then reports that the jets are unavailable.
@@ -98,6 +106,14 @@ macro_rules! impl_jet_hinter {
                 jet.as_any()
                     .downcast_ref::<$jet_type>()
                     .map(|jet| Box::new(*jet) as Box<dyn JetHL>)
+            }
+
+            fn parse_simplicity(
+                &self,
+                source: &str,
+            ) -> Result<simplicity::human_encoding::Forest, String> {
+                simplicity::human_encoding::Forest::parse::<$jet_type>(source)
+                    .map_err(|e| e.to_string())
             }
 
             fn clone_box(&self) -> Box<dyn JetHinter> {

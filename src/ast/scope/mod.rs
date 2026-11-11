@@ -26,6 +26,7 @@ use super::{CustomFunction, ElementsJetHinter, Expression, JetHinter, Program};
 /// 3. Assigning types to each witness expression
 /// 4. Resolving calls to custom functions
 pub(super) struct Scope {
+    pub(super) sources: Option<crate::driver::SourceMap>,
     modules: ModuleTree,
     locals: Locals,
     inputs: ProgramInputs,
@@ -52,6 +53,7 @@ impl Default for Scope {
 impl Scope {
     pub(super) fn new(jet_hinter: Box<dyn JetHinter>) -> Self {
         Self {
+            sources: None,
             modules: ModuleTree::default(),
             locals: Locals::default(),
             inputs: ProgramInputs::default(),

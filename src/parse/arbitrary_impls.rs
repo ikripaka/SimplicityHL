@@ -162,7 +162,7 @@ impl crate::ArbitraryRec for Function {
             name,
             params,
             ret,
-            body,
+            body: super::FunctionBody::HighLevel(body),
             span: Span::DUMMY,
         })
     }

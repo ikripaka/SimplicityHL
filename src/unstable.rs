@@ -36,6 +36,8 @@ pub enum UnstableFeature {
     /// Raw-hash syntax: the `raw_hash::<T>(tuple)` builtin, which hashes a
     /// tuple of unsigned integers. Enable with `simc -Z raw_hash`.
     RawHash,
+    /// External typed raw Simplicity functions.
+    Simplicity,
 }
 
 impl UnstableFeature {
@@ -49,12 +51,13 @@ impl UnstableFeature {
     /// Append the new variant here, bump the count in
     /// `all_contains_every_variant` ( in the `tests` module below), then
     /// gate the syntax via [`RequireFeature`].
-    pub const ALL: &'static [Self] = &[Self::Imports, Self::Enums, Self::RawHash];
+    pub const ALL: &'static [Self] = &[Self::Imports, Self::Enums, Self::RawHash, Self::Simplicity];
 
     /// Human-readable description shown next to the feature's name under
     /// `simc --help`.
     pub fn description(&self) -> &'static str {
         match self {
+            Self::Simplicity => "Typed functions implemented in external .simpl files",
             Self::Imports => {
                 "Module system syntax: 'use' imports, 'mod' modules, 'as' aliases, 'crate::' paths"
             }
@@ -224,6 +227,7 @@ impl<L: RequireFeature, R: RequireFeature> RequireFeature for either::Either<L, 
 impl fmt::Display for UnstableFeature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Simplicity => write!(f, "simplicity"),
             Self::Imports => write!(f, "imports"),
             Self::Enums => write!(f, "enums"),
             Self::RawHash => write!(f, "raw_hash"),
@@ -238,6 +242,7 @@ impl FromStr for UnstableFeature {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "simplicity" => Ok(UnstableFeature::Simplicity),
             "imports" => Ok(UnstableFeature::Imports),
             "enums" => Ok(UnstableFeature::Enums),
             "raw_hash" => Ok(UnstableFeature::RawHash),
@@ -363,7 +368,7 @@ mod tests {
         // the variant to `ALL`. Pins that `ALL` stays complete.
         assert_eq!(
             all_features.len(),
-            3,
+            4,
             "update this count when adding a feature"
         );
 

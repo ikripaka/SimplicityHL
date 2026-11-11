@@ -51,6 +51,39 @@ impl Program {
         }
     }
 
+    /// Preserve external file references when modules are emitted into one file.
+    pub(crate) fn absolutize_raw_paths(
+        &mut self,
+        sources: &crate::driver::SourceMap,
+    ) -> Result<(), Diagnostic> {
+        fn visit(items: &mut [Item], sources: &crate::driver::SourceMap) -> Result<(), Diagnostic> {
+            for item in items {
+                match item {
+                    Item::Function(function) => {
+                        if let FunctionBody::Simplicity { path, .. } = &mut function.body {
+                            let resolved = sources
+                                .path(function.span.file_id)
+                                .and_then(|p| p.as_path().parent())
+                                .map(|parent| parent.join(path.as_ref()));
+                            let text = resolved
+                                .as_ref()
+                                .and_then(|p| p.to_str())
+                                .filter(|s| !s.contains(['"', '\\', '\n', '\r']));
+                            let text = text.ok_or_else(|| Diagnostic::new(Error::Simplicity {
+                                msg: "cannot represent the external file path in flattened source".into(),
+                            }, function.span))?;
+                            *path = Arc::from(text);
+                        }
+                    }
+                    Item::Module(module) => visit(Arc::make_mut(&mut module.items), sources)?,
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        visit(Arc::make_mut(&mut self.items), sources)
+    }
+
     /// Access the items of the program.
     pub fn items(&self) -> &[Item] {
         &self.items
@@ -234,8 +267,15 @@ pub struct Function {
     name: FunctionName,
     params: Arc<[FunctionParam]>,
     ret: Option<AliasedType>,
-    body: Expression,
+    body: FunctionBody,
     span: Span,
+}
+
+/// A function implementation, either HL syntax or an external raw fragment.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FunctionBody {
+    HighLevel(Expression),
+    Simplicity { path: Arc<str>, entry: Arc<str> },
 }
 
 impl Function {
@@ -260,8 +300,15 @@ impl Function {
         self.ret.as_ref()
     }
 
-    /// Access the body of the function.
+    /// Access the HL body. Panics for external functions; use `implementation` for those.
     pub fn body(&self) -> &Expression {
+        match &self.body {
+            FunctionBody::HighLevel(body) => body,
+            FunctionBody::Simplicity { .. } => panic!("external functions have no HL body"),
+        }
+    }
+
+    pub fn implementation(&self) -> &FunctionBody {
         &self.body
     }
 
@@ -271,9 +318,21 @@ impl Function {
     }
 }
 
-impl_eq_hash!(Function; visibility, name, params, ret, body);
+impl_eq_hash!(Function; visibility, name, params, ret, implementation);
 
-impl_require_feature!(Function { recurse: params, ret, body; });
+impl RequireFeature for Function {
+    fn feature_requirements(&self, out: &mut Vec<FeatureRequirement>) {
+        self.params.feature_requirements(out);
+        self.ret.feature_requirements(out);
+        match &self.body {
+            FunctionBody::HighLevel(body) => body.feature_requirements(out),
+            FunctionBody::Simplicity { .. } => out.push(FeatureRequirement::new(
+                UnstableFeature::Simplicity,
+                self.span,
+            )),
+        }
+    }
+}
 
 /// Parameter of a function.
 #[derive(Clone, Debug)]

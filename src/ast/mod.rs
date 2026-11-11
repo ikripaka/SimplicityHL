@@ -355,8 +355,9 @@ impl PartialEq for CallName {
 pub struct CustomFunction {
     params: Arc<[FunctionParam]>,
     ret: ResolvedType,
-    /// `None` if the analysis of the body failed.
+    /// `None` for an external function or if analysis of the body failed.
     body: Option<Arc<Expression>>,
+    raw_body: Option<Arc<simplicity::CommitNode>>,
     span: Span,
 }
 
@@ -375,14 +376,19 @@ impl CustomFunction {
     ///
     /// ## Panics
     ///
-    /// Panics if the analysis of the body failed. This cannot happen for a function
-    /// of an analyzed [`Program`], because a program with errors is never built.
+    /// Panics for an external function (use [`Self::raw_body`]) or if analysis
+    /// failed. Programs with analysis errors are never built.
     pub fn body(&self) -> &Expression {
         self.analyzed_body()
             .expect("programs with errors are never built")
     }
 
-    /// Access the body of the function, if its analysis succeeded.
+    /// Access a checked external Simplicity implementation, if present.
+    pub fn raw_body(&self) -> Option<&Arc<simplicity::CommitNode>> {
+        self.raw_body.as_ref()
+    }
+
+    /// Access the HL body if its analysis succeeded.
     fn analyzed_body(&self) -> Option<&Expression> {
         self.body.as_deref()
     }
@@ -404,7 +410,7 @@ impl CustomFunction {
     }
 }
 
-impl_eq_hash!(CustomFunction; params, ret, analyzed_body);
+impl_eq_hash!(CustomFunction; params, ret, analyzed_body, raw_body);
 
 /// Parameter of a function.
 #[derive(Clone, Debug)]

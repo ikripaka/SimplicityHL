@@ -408,6 +408,21 @@ impl SingleExpression {
     }
 }
 
+impl crate::ast::CustomFunction {
+    fn compile_body<'brand>(
+        &self,
+        scope: &mut Scope<'brand>,
+    ) -> Result<PairBuilder<ProgNode<'brand>>, Diagnostic> {
+        match self.raw_body() {
+            Some(raw) => Ok(PairBuilder::from_node(crate::raw_simplicity::import(
+                raw,
+                scope.ctx(),
+            ))),
+            None => self.body().compile(scope),
+        }
+    }
+}
+
 impl Call {
     fn compile<'brand>(
         &self,
@@ -471,18 +486,18 @@ impl Call {
             }
             CallName::Custom(function) => {
                 let mut function_scope = scope.child(function.params_pattern());
-                let body = function.body().compile(&mut function_scope)?;
+                let body = function.compile_body(&mut function_scope)?;
                 args.comp(&body).with_span(self)
             }
             CallName::Fold(function, bound) => {
                 let mut function_scope = scope.child(function.params_pattern());
-                let body = function.body().compile(&mut function_scope)?;
+                let body = function.compile_body(&mut function_scope)?;
                 let fold_body = list_fold(*bound, body.as_ref()).with_span(self)?;
                 args.comp(&fold_body).with_span(self)
             }
             CallName::ArrayFold(function, size) => {
                 let mut function_scope = scope.child(function.params_pattern());
-                let body = function.body().compile(&mut function_scope)?;
+                let body = function.compile_body(&mut function_scope)?;
                 let fold_body = array_fold(*size, body.as_ref()).with_span(self)?;
                 args.comp(&fold_body).with_span(self)
             }
@@ -492,7 +507,7 @@ impl Call {
             }
             CallName::ForWhile(function, bit_width) => {
                 let mut function_scope = scope.child(function.params_pattern());
-                let body = function.body().compile(&mut function_scope)?;
+                let body = function.compile_body(&mut function_scope)?;
                 let fold_body = for_while(*bit_width, body).with_span(self)?;
                 args.comp(&fold_body).with_span(self)
             }

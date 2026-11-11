@@ -405,6 +405,10 @@ impl<'brand, P: CoreExt<'brand>> SelectorBuilder<P> {
 pub struct PairBuilder<P>(P);
 
 impl<'brand, P: CoreExt<'brand>> PairBuilder<P> {
+    pub(crate) fn from_node(node: P) -> Self {
+        Self(node)
+    }
+
     /// Create the unit expression.
     ///
     /// ## Invariant

@@ -23,6 +23,8 @@ impl Program {
         diagnostics: &mut DiagnosticManager,
     ) -> Option<Self> {
         let mut scope = Scope::new(jet_hinter);
+        scope.sources = diagnostics.sources().cloned();
+
         let main = Self::analyze_main(from, &mut scope);
         scope.try_into_program(main, diagnostics)
     }
@@ -219,20 +221,45 @@ impl AbstractSyntaxTree for Function {
                     scope.resolve_or_never(aliased, from)
                 });
 
-            let body = scope.in_function(|scope| {
-                for param in params.iter() {
-                    scope.insert_variable(param.identifier().clone(), param.ty().clone());
+            let (body, raw_body) = match from.implementation() {
+                parse::FunctionBody::HighLevel(expression) => {
+                    let body = scope.in_function(|scope| {
+                        for param in params.iter() {
+                            scope.insert_variable(param.identifier().clone(), param.ty().clone());
+                        }
+                        Expression::analyze(expression, &ret, scope).map(Arc::new)
+                    });
+                    (body.map_err(|failure| scope.report(failure)).ok(), None)
                 }
-                Expression::analyze(from.body(), &ret, scope).map(Arc::new)
-            });
-
-            // A broken body does not change the declared signature,
-            // so later items can still call the function.
-            let body = body.map_err(|failure| scope.report(failure)).ok();
+                parse::FunctionBody::Simplicity { .. }
+                    if ret.contains_never() || params.iter().any(|p| p.ty().contains_never()) =>
+                {
+                    // Signature errors were already reported. Recovery types cannot
+                    // be lowered to Simplicity, but keep the declaration in scope.
+                    (None, None)
+                }
+                parse::FunctionBody::Simplicity { path, entry } => {
+                    let raw = crate::raw_simplicity::load(
+                        path,
+                        entry,
+                        from.span().file_id,
+                        scope.sources.as_ref(),
+                        scope.jet_hinter(),
+                        &ResolvedType::tuple(params.iter().map(|p| p.ty().clone())),
+                        &ret,
+                    )
+                    .map_err(|msg| Error::Simplicity { msg })
+                    .with_span(from)
+                    .map_err(|failure| scope.report(failure))
+                    .ok();
+                    (None, raw)
+                }
+            };
             let function = CustomFunction {
                 params,
                 ret,
                 body,
+                raw_body,
                 span: *from.span(),
             };
             scope
@@ -240,6 +267,16 @@ impl AbstractSyntaxTree for Function {
                 .with_span(from)?;
 
             return Ok(Self::Custom);
+        }
+
+        if matches!(
+            from.implementation(),
+            parse::FunctionBody::Simplicity { .. }
+        ) {
+            return Err(Error::Simplicity {
+                msg: "main must have a SimplicityHL body".into(),
+            })
+            .with_span(from)?;
         }
 
         if matches!(from.visibility(), Visibility::Public) {

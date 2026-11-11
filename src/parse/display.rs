@@ -95,7 +95,17 @@ impl fmt::Display for TypeAlias {
 
 impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}fn {}(", self.visibility(), self.name())?;
+        if let super::FunctionBody::Simplicity { path, entry } = self.implementation() {
+            writeln!(f, "#[simplicity(path = \"{path}\", entry = \"{entry}\")]")?;
+        }
+        write!(f, "{}", self.visibility())?;
+        if matches!(
+            self.implementation(),
+            super::FunctionBody::Simplicity { .. }
+        ) {
+            write!(f, "extern ")?;
+        }
+        write!(f, "fn {}(", self.name())?;
         for (i, param) in self.params().iter().enumerate() {
             if 0 < i {
                 write!(f, ", ")?;
@@ -106,7 +116,10 @@ impl fmt::Display for Function {
         if let Some(ty) = self.ret() {
             write!(f, " -> {ty}")?;
         }
-        write!(f, " {}", self.body())
+        match self.implementation() {
+            super::FunctionBody::HighLevel(body) => write!(f, " {body}"),
+            super::FunctionBody::Simplicity { .. } => write!(f, ";"),
+        }
     }
 }
 
