@@ -7,6 +7,7 @@ use simplicity::{types, CommitNode};
 
 use crate::ast::JetHinter;
 use crate::driver::SourceMap;
+use crate::error::Error;
 use crate::named::{ConstructNode, WithNames};
 use crate::types::{ResolvedType, StructuralType};
 use crate::TemplateProgramWitness;
@@ -19,48 +20,50 @@ pub(crate) fn load(
     jets: &dyn JetHinter,
     input: &ResolvedType,
     output: &ResolvedType,
-) -> Result<Arc<CommitNode>, String> {
+) -> Result<Arc<CommitNode>, Error> {
+    let raw_error = |msg: String| Error::Simplicity { msg };
     let path = if std::path::Path::new(path).is_absolute() {
         std::path::PathBuf::from(path)
     } else {
-        let declaring_file = sources.and_then(|s| s.path(file_id)).ok_or(
-            "relative external paths require a named source file; use the file-based compiler API",
-        )?;
+        let declaring_file = sources.and_then(|s| s.path(file_id)).ok_or_else(|| raw_error(
+            "relative external paths require a named source file; use the file-based compiler API".into(),
+        ))?;
         let parent = declaring_file
             .as_path()
             .parent()
-            .ok_or("source file has no parent directory")?;
+            .ok_or_else(|| raw_error("source file has no parent directory".into()))?;
         parent.join(path)
     };
     let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        .map_err(|e| raw_error(format!("cannot read {}: {e}", path.display())))?;
     let forest = jets
         .parse_simplicity(&text)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+        .map_err(|e| raw_error(format!("{}: {e}", path.display())))?;
     let root = forest
         .roots()
         .get(entry)
-        .ok_or_else(|| format!("{} has no root entry `{entry}`", path.display()))?
+        .ok_or_else(|| raw_error(format!("{} has no root entry `{entry}`", path.display())))?
         .to_commit_node();
     for item in root.as_ref().post_order_iter::<InternalSharing>() {
         match item.node.inner() {
-            Inner::Witness(_) | Inner::Disconnect(..) => return Err(format!(
+            Inner::Witness(_) | Inner::Disconnect(..) => return Err(raw_error(format!(
                 "{}: entry `{entry}` contains a witness or disconnect; pass inputs through HL parameters",
                 path.display()
-            )),
+            ))),
             _ => {}
         }
     }
-    let input = StructuralType::from(input);
-    let output = StructuralType::from(output);
-    if root.arrow().source.as_ref() != input.as_ref()
-        || root.arrow().target.as_ref() != output.as_ref()
-    {
-        return Err(format!(
-            "{}: entry `{entry}` has type {}, declared {input} → {output}",
-            path.display(),
-            root.arrow()
-        ));
+    let found_input = StructuralType::from(Arc::clone(&root.arrow().source));
+    let found_output = StructuralType::from(Arc::clone(&root.arrow().target));
+    if found_input != StructuralType::from(input) || found_output != StructuralType::from(output) {
+        return Err(Error::SimplicityTypeMismatch {
+            path,
+            entry: entry.to_owned(),
+            expected_input: input.clone(),
+            expected_output: output.clone(),
+            found_input,
+            found_output,
+        });
     }
     Ok(root)
 }

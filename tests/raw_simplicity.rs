@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use simplicityhl::ast::ElementsJetHinter;
+use simplicityhl::error::{DiagnosticManager, Error, Location, Severity};
 use simplicityhl::resolution::DependencyMapBuilder;
 use simplicityhl::source::{CanonPath, CanonSourceFile};
 use simplicityhl::{
@@ -45,6 +46,357 @@ fn compile(root: &Path, enabled: bool) -> Result<CompiledProgram, String> {
         false,
         Box::new(ElementsJetHinter::new()),
     )
+}
+
+fn analyze(root: &Path) -> Result<simplicityhl::TemplateAst, DiagnosticManager> {
+    let path = root.join("main.simf");
+    let source = CanonSourceFile::new(
+        CanonPath::canonicalize(&path).unwrap(),
+        Arc::from(std::fs::read_to_string(path).unwrap()),
+    );
+    let deps = DependencyMapBuilder::new()
+        .build(CanonPath::canonicalize(root).unwrap())
+        .unwrap();
+    simplicityhl::TemplateAst::new_with_dep(
+        source,
+        &deps,
+        &UnstableFeatures::all(),
+        Box::new(ElementsJetHinter::new()),
+    )
+}
+
+#[test]
+fn structured_signature_mismatches() {
+    use simplicityhl::types::{StructuralType, TypeConstructible};
+    use simplicityhl::ResolvedType;
+
+    for (name, decl, raw, mismatch, input, output) in [
+        (
+            "input",
+            DECL.replace("a: u32", "a: u16"),
+            RAW,
+            "input",
+            StructuralType::tuple([StructuralType::u32(), StructuralType::u32()]),
+            StructuralType::boolean(),
+        ),
+        (
+            "output",
+            DECL.replace("-> bool", "-> u32"),
+            RAW,
+            "output",
+            StructuralType::tuple([StructuralType::u32(), StructuralType::u32()]),
+            StructuralType::boolean(),
+        ),
+        (
+            "both",
+            DECL.replace("a: u32", "a: u16")
+                .replace("-> bool", "-> u32"),
+            RAW,
+            "input and output",
+            StructuralType::tuple([StructuralType::u32(), StructuralType::u32()]),
+            StructuralType::boolean(),
+        ),
+    ] {
+        let source = format!("{decl}\nfn main() {{}}");
+        let root = project(
+            &format!("structured-{name}"),
+            &[("main.simf", &source), ("equal32.simpl", raw)],
+        );
+        let errors = analyze(&root).unwrap_err();
+        assert_eq!(errors.error_count(), 1);
+        let diag = &errors.diagnostics()[0];
+        assert_eq!(*diag.severity(), Severity::Error);
+        let Location::Code(span) = diag.location() else {
+            panic!("expected declaration span")
+        };
+        assert_eq!(
+            errors
+                .sources()
+                .unwrap()
+                .path(span.file_id)
+                .unwrap()
+                .as_path(),
+            root.join("main.simf").canonicalize().unwrap()
+        );
+        let Error::SimplicityTypeMismatch {
+            path,
+            entry,
+            expected_input,
+            expected_output,
+            found_input,
+            found_output,
+        } = diag.error()
+        else {
+            panic!("unexpected error: {diag:?}")
+        };
+        assert_eq!(path, &root.join("equal32.simpl").canonicalize().unwrap());
+        assert_eq!(entry, "equal32");
+        let expected_first = if name == "output" {
+            ResolvedType::u32()
+        } else {
+            ResolvedType::u16()
+        };
+        let expected_ret = if name == "input" {
+            ResolvedType::boolean()
+        } else {
+            ResolvedType::u32()
+        };
+        assert_eq!(
+            *expected_input,
+            ResolvedType::tuple([expected_first, ResolvedType::u32()])
+        );
+        assert_eq!(*expected_output, expected_ret);
+        assert_eq!(found_input, &input);
+        assert_eq!(found_output, &output);
+        assert_eq!(
+            StructuralType::from(expected_input) != *found_input,
+            name != "output"
+        );
+        assert_eq!(
+            StructuralType::from(expected_output) != *found_output,
+            name != "input"
+        );
+        let rendered = errors.render_to_string();
+        for part in [
+            "equal32.simpl",
+            "equal32",
+            mismatch,
+            "declared HL",
+            "expected structural",
+            "found",
+            "annotating",
+        ] {
+            assert!(rendered.contains(part), "missing {part}: {rendered}");
+        }
+    }
+}
+
+#[test]
+fn broken_enum_payload_in_each_signature_position_is_not_lowered() {
+    for (name, signature) in [("parameter", "bad(a: E)"), ("return", "bad() -> E")] {
+        let source = format!("enum E {{ Bad(Missing), Good }}\n#[simplicity(path = \"absent.simpl\", entry = \"bad\")] extern fn {signature};\nfn main() {{}}");
+        let root = project(&format!("enum-{name}-recovery"), &[("main.simf", &source)]);
+        let errors = analyze(&root).unwrap_err();
+        let rendered = errors.render_to_string();
+        assert!(rendered.contains("Missing"), "{rendered}");
+        assert!(!rendered.contains("cannot read"), "{rendered}");
+        assert!(!errors
+            .diagnostics()
+            .iter()
+            .any(|d| matches!(d.error(), Error::SimplicityTypeMismatch { .. })));
+    }
+}
+
+#[test]
+fn imported_mismatch_points_to_the_declaration() {
+    let decl = DECL
+        .replace("extern fn", "pub extern fn")
+        .replace("-> bool", "-> u32");
+    let root = project(
+        "imported-mismatch",
+        &[
+            (
+                "main.simf",
+                "use crate::nested::lib::raw_equal32; fn main() {}",
+            ),
+            ("nested/lib.simf", &decl),
+            ("nested/equal32.simpl", RAW),
+        ],
+    );
+    let errors = analyze(&root).unwrap_err();
+    let diag = errors
+        .diagnostics()
+        .iter()
+        .find(|d| matches!(d.error(), Error::SimplicityTypeMismatch { .. }))
+        .unwrap();
+    let Location::Code(span) = diag.location() else {
+        panic!("expected declaration span")
+    };
+    assert_eq!(
+        errors
+            .sources()
+            .unwrap()
+            .path(span.file_id)
+            .unwrap()
+            .as_path(),
+        root.join("nested/lib.simf").canonicalize().unwrap()
+    );
+    let rendered = errors.render_to_string();
+    assert!(rendered.contains("nested/lib.simf"), "{rendered}");
+    assert!(rendered.contains("nested/equal32.simpl"), "{rendered}");
+}
+
+#[test]
+fn malformed_signatures_recover_and_report_independent_errors() {
+    let source = "enum E { Bad(Missing), Good }\n\
+        #[simplicity(path = \"absent.simpl\", entry = \"bad\")] extern fn bad(a: E) -> E;\n\
+        #[simplicity(path = \"equal32.simpl\", entry = \"equal32\")] extern fn wrong(a: u16, b: u32) -> bool;\n\
+        fn main() { let e: E = E::Good; let x: E = bad(e); assert!(wrong(1, 1)); }";
+    let root = project(
+        "enum-recovery",
+        &[("main.simf", source), ("equal32.simpl", RAW)],
+    );
+    let errors = analyze(&root).unwrap_err();
+    assert!(errors
+        .diagnostics()
+        .iter()
+        .any(|d| matches!(d.error(), Error::SimplicityTypeMismatch { .. })));
+    let rendered = errors.render_to_string();
+    assert!(rendered.contains("Missing"), "{rendered}");
+    assert!(!rendered.contains("cannot read"), "{rendered}");
+    assert!(
+        !rendered.contains("not defined as a function"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn raw_structural_shape_is_checked_and_equivalence_is_allowed() {
+    for (name, decl, raw, valid) in [
+        (
+            "equivalent",
+            "extern fn f(a: u16) -> u16;",
+            "f := iden : (2^8 * 2^8) -> (2^8 * 2^8)",
+            true,
+        ),
+        (
+            "shape",
+            "extern fn f(a: u2) -> u2;",
+            "f := iden : (1 + (1 + 1)) -> (1 + (1 + 1))",
+            false,
+        ),
+        ("inferred", "extern fn f() -> bool;", "f := injl unit", true),
+    ] {
+        let source =
+            format!("#[simplicity(path = \"f.simpl\", entry = \"f\")] {decl}\nfn main() {{}}");
+        let root = project(
+            &format!("structure-{name}"),
+            &[("main.simf", &source), ("f.simpl", raw)],
+        );
+        let result = analyze(&root);
+        if valid {
+            assert!(result.is_ok(), "{name}: {result:?}");
+        } else {
+            assert!(result
+                .unwrap_err()
+                .diagnostics()
+                .iter()
+                .any(|d| matches!(d.error(), Error::SimplicityTypeMismatch { .. })));
+        }
+    }
+}
+
+#[test]
+fn multiple_bad_declarations_remain_in_scope() {
+    let first = DECL
+        .replace("raw_equal32", "first")
+        .replace("a: u32", "a: u16");
+    let second = DECL
+        .replace("raw_equal32", "second")
+        .replace("-> bool", "-> u32");
+    let source = format!(
+        "{first}\n{second}\nfn main() {{ assert!(first(1, 1)); let x: u32 = second(1, 1); }}"
+    );
+    let root = project(
+        "multiple-bad",
+        &[("main.simf", &source), ("equal32.simpl", RAW)],
+    );
+    let errors = analyze(&root).unwrap_err();
+    assert_eq!(
+        errors
+            .diagnostics()
+            .iter()
+            .filter(|d| matches!(d.error(), Error::SimplicityTypeMismatch { .. }))
+            .count(),
+        2,
+        "{errors}"
+    );
+    assert!(
+        !errors
+            .diagnostics()
+            .iter()
+            .any(|d| matches!(d.error(), Error::FunctionUndefined { .. })),
+        "{errors}"
+    );
+}
+
+#[test]
+fn external_calls_use_hl_type_rules() {
+    for (name, prefix, call, expected) in [
+        ("count", "", "raw_equal32(1)", "count"),
+        ("argument", "", "raw_equal32(true, 1)", "type"),
+        (
+            "result",
+            "",
+            "{ let x: u32 = raw_equal32(1, 1); true }",
+            "type",
+        ),
+        ("overflow", "", "raw_equal32(4294967296, 1)", "integer"),
+    ] {
+        let source = format!("{prefix}\n{DECL}\nfn main() {{ assert!({call}); }}");
+        let root = project(
+            &format!("hl-call-{name}"),
+            &[("main.simf", &source), ("equal32.simpl", RAW)],
+        );
+        let errors = analyze(&root).unwrap_err();
+        assert!(
+            errors.diagnostics().iter().any(|d| match expected {
+                "count" => matches!(d.error(), Error::InvalidNumberOfArguments { .. }),
+                "type" => matches!(d.error(), Error::ExpressionTypeMismatch { .. }),
+                "integer" => matches!(
+                    d.error(),
+                    Error::ParseInt { .. } | Error::ParseCrateInt { .. }
+                ),
+                _ => false,
+            }),
+            "{name}: {errors}"
+        );
+    }
+}
+
+#[test]
+fn external_calls_reject_distinct_enums() {
+    let source = "enum E { A, B } enum F { A, B }\n\
+        #[simplicity(path = \"f.simpl\", entry = \"f\")] extern fn f(a: E) -> E;\n\
+        fn main() { let x: F = F::A; let y: E = f(x); }";
+    let root = project(
+        "hl-call-enums",
+        &[("main.simf", source), ("f.simpl", "f := iden : 2 -> 2")],
+    );
+    let errors = analyze(&root).unwrap_err();
+    assert!(
+        errors
+            .diagnostics()
+            .iter()
+            .any(|d| matches!(d.error(), Error::ExpressionTypeMismatch { .. })),
+        "{errors}"
+    );
+}
+
+#[test]
+fn raw_loading_errors_keep_their_category() {
+    for (name, raw, entry) in [
+        ("missing-file", None, "equal32"),
+        ("missing-entry", Some(RAW), "absent"),
+    ] {
+        let decl = DECL.replace("entry = \"equal32\"", &format!("entry = \"{entry}\""));
+        let source = format!("{decl}\nfn main() {{}}");
+        let files = if let Some(raw) = raw {
+            vec![("main.simf", source.as_str()), ("equal32.simpl", raw)]
+        } else {
+            vec![("main.simf", source.as_str())]
+        };
+        let root = project(&format!("category-{name}"), &files);
+        let errors = analyze(&root).unwrap_err();
+        assert!(errors
+            .diagnostics()
+            .iter()
+            .any(|d| matches!(d.error(), Error::Simplicity { .. })));
+        assert!(!errors
+            .diagnostics()
+            .iter()
+            .any(|d| matches!(d.error(), Error::SimplicityTypeMismatch { .. })));
+    }
 }
 
 #[test]

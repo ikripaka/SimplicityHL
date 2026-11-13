@@ -11,6 +11,44 @@ Run `simc --help`; the features are listed under the `-Z` flag.
 
 Pass `-Z <feature-name>` to `simc`.
 
+## `simplicity`
+
+An external function can call a closed raw Simplicity entry from a disk file:
+
+```rust
+#[simplicity(path = "equal32.simpl", entry = "equal32")]
+extern fn raw_equal32(a: u32, b: u32) -> bool;
+```
+
+The raw path is relative to the declaring HL file. The file must remain
+available when the program is analyzed, including when flattened source is
+compiled later. The compiler validates even unused declarations. It compares
+the finalized entry arrow to the structural encoding of the HL parameter tuple
+and return type. Zero parameters or an omitted return type encode unit; one
+parameter uses its own representation, and multiple parameters use the usual
+tuple layout. Structural shape matters, though equivalent encodings such as
+`(2^8 * 2^8)` and `u16` are accepted at this boundary. HL calls still obey HL
+type rules, including nominal enum types and literal range checks.
+
+For example, a declaration returning `u32` for an entry returning `2` reports
+an output mismatch with the path, entry, declared HL types, and expected and
+found structural arrows. Inferred raw types are finalized independently of the
+HL declaration; annotate the raw entry if inference chooses an unintended type.
+File, parse, missing-entry, and unsupported-node failures are reported separately.
+
+Rust consumers can inspect the diagnostics returned by `TemplateAst::new_with_dep`
+or `TemplateAst::new_with_unstable`:
+
+```rust,ignore
+for diagnostic in errors.diagnostics() {
+    if let simplicityhl::error::Error::SimplicityTypeMismatch {
+        path, entry, expected_input, expected_output, found_input, found_output,
+    } = diagnostic.error() {
+        // Inspect the declaration and both structural types.
+    }
+}
+```
+
 ## `raw_hash`
 
 `raw_hash::<T>(tuple)` hashes a tuple of unsigned integers with SHA-256:

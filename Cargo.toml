@@ -64,6 +64,7 @@ cargo-fuzz = "0.13.1"
 [lints.clippy]
 # Exclude lints we don't think are valuable.
 large_enum_variant = "allow" # docs say "measure before paying attention to this"; why is it on by default??
+result_large_err = "allow" # Error carries structured type diagnostics; diagnostics themselves are boxed.
 similar_names = "allow" # Too many (subjectively) false positives.
 uninlined_format_args = "allow" # This is a subjective style choice.
 indexing_slicing = "allow" # Too many false positives ... would be cool though

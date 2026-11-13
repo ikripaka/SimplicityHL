@@ -22,7 +22,7 @@ use crate::driver::{SourceMap, CRATE_STR, MAIN_MODULE};
 use crate::lexer::Token;
 use crate::parse::MatchPattern;
 use crate::str::{AliasName, FunctionName, Identifier, JetName, ModuleName};
-use crate::types::{ResolvedType, UIntType};
+use crate::types::{ResolvedType, StructuralType, UIntType};
 use crate::unstable::UnstableFeature;
 use crate::TemplateProgramWitness;
 
@@ -833,6 +833,15 @@ pub enum Error {
     Simplicity {
         msg: String,
     },
+    /// A finalized raw entry differs from its declared HL signature.
+    SimplicityTypeMismatch {
+        path: PathBuf,
+        entry: String,
+        expected_input: ResolvedType,
+        expected_output: ResolvedType,
+        found_input: StructuralType,
+        found_output: StructuralType,
+    },
     CannotParse {
         msg: String,
     },
@@ -1047,6 +1056,17 @@ impl fmt::Display for Error {
                 "Expected a valid bit string length (1, 2, 4, 8, 16, 32, 64, 128, 256), found {len}"
             ),
             Error::Simplicity { msg } => write!(f, "Raw Simplicity: {msg}"),
+            Error::SimplicityTypeMismatch { path, entry, expected_input, expected_output, found_input, found_output } => {
+                let input = StructuralType::from(expected_input);
+                let output = StructuralType::from(expected_output);
+                let mismatch = match (input != *found_input, output != *found_output) {
+                    (true, true) => "input and output",
+                    (true, false) => "input",
+                    (false, true) => "output",
+                    (false, false) => "signature",
+                };
+                write!(f, "Raw Simplicity: {} entry `{entry}` has a mismatched {mismatch}; declared HL {expected_input} → {expected_output}, expected structural {input} → {output}, found {found_input} → {found_output}. Consider annotating the raw entry's type.", path.display())
+            },
             Error::CannotParse{ msg } => write!(
                 f,
                 "Cannot parse: {msg}"

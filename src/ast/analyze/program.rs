@@ -232,7 +232,8 @@ impl AbstractSyntaxTree for Function {
                     (body.map_err(|failure| scope.report(failure)).ok(), None)
                 }
                 parse::FunctionBody::Simplicity { .. }
-                    if ret.contains_never() || params.iter().any(|p| p.ty().contains_never()) =>
+                    if !ret.has_structural_type()
+                        || params.iter().any(|p| !p.ty().has_structural_type()) =>
                 {
                     // Signature errors were already reported. Recovery types cannot
                     // be lowered to Simplicity, but keep the declaration in scope.
@@ -248,7 +249,6 @@ impl AbstractSyntaxTree for Function {
                         &ResolvedType::tuple(params.iter().map(|p| p.ty().clone())),
                         &ret,
                     )
-                    .map_err(|msg| Error::Simplicity { msg })
                     .with_span(from)
                     .map_err(|failure| scope.report(failure))
                     .ok();
