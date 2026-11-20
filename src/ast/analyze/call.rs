@@ -12,7 +12,7 @@ use crate::types::{
 
 use super::super::recovery::Failure;
 use super::super::scope::Scope;
-use super::super::{Call, CallName, Expression, FunctionParam};
+use super::super::{Call, CallName, Expression, FunctionDefinition, FunctionParam};
 use super::AbstractSyntaxTree;
 
 /// Do `a` and `b` carry the same enum at every corresponding position?
@@ -87,6 +87,21 @@ impl AbstractSyntaxTree for Call {
                     |(arg_parse, arg_ty), scope| Expression::analyze(arg_parse, arg_ty, scope),
                 )
                 .map(Arc::from)
+        }
+
+        fn analyze_function_arguments(
+            from: &parse::Call,
+            ty: &ResolvedType,
+            params: &[FunctionParam],
+            ret: &ResolvedType,
+            scope: &mut Scope,
+        ) -> Result<Arc<[Expression]>, Failure> {
+            let args_ty: Vec<_> = params.iter().map(FunctionParam::ty).cloned().collect();
+
+            scope.report_err(check_output_type(ret, ty).with_span(from));
+
+            check_argument_types(from.args(), &args_ty).with_span(from)?;
+            analyze_arguments(from.args(), &args_ty, scope)
         }
 
         let name = CallName::analyze(from, scope)?;
@@ -190,17 +205,10 @@ impl AbstractSyntaxTree for Call {
                 analyze_arguments(from.args(), &args_tys, scope)?
             }
             CallName::Custom(function) => {
-                let args_ty = function
-                    .params()
-                    .iter()
-                    .map(FunctionParam::ty)
-                    .cloned()
-                    .collect::<Vec<ResolvedType>>();
-                let out_ty = function.ret();
-                scope.report_err(check_output_type(out_ty, ty).with_span(from));
-
-                check_argument_types(from.args(), &args_ty).with_span(from)?;
-                analyze_arguments(from.args(), &args_ty, scope)?
+                analyze_function_arguments(from, ty, function.params(), function.ret(), scope)?
+            }
+            CallName::Extern(function) => {
+                analyze_function_arguments(from, ty, function.params(), function.ret(), scope)?
             }
             CallName::Fold(function, bound) => {
                 // A list fold has the signature:
@@ -345,9 +353,10 @@ impl CallName {
             parse::CallName::TypeCast(target) => {
                 scope.resolve(target).map(Self::TypeCast).with_span(from)
             }
-            parse::CallName::Custom(name) => {
-                scope.get_function(name).map(Self::Custom).with_span(from)
-            }
+            parse::CallName::Custom(name) => match scope.get_function(name).with_span(from)? {
+                FunctionDefinition::Ordinary(function) => Ok(Self::Custom(function)),
+                FunctionDefinition::Extern(function) => Ok(Self::Extern(function)),
+            },
             parse::CallName::ArrayFold(name, size) => {
                 let function = scope.get_function(name).with_span(from)?;
                 // A function that is used in a array fold has the signature:

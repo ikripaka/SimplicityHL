@@ -1,0 +1,13 @@
+-- Increments modulo 2^256.
+-- Words are big-endian: increment the low half, then carry into the high half.
+-- full_increment_64 takes (carry, word) and returns (carry_out, word).
+low128 := comp (pair (take iden) (drop drop iden)) jet_full_increment_64
+high128 := comp (pair (comp low128 (take iden)) (drop take iden)) jet_full_increment_64
+increment128 := pair (comp high128 (take iden)) (pair (comp high128 (drop iden)) (comp low128 (drop iden))) : (2 * 2^128) -> (2 * 2^128)
+
+low256 := comp (pair (take iden) (drop drop iden)) increment128
+high256 := comp (pair (comp low256 (take iden)) (drop take iden)) increment128
+increment256 := pair (comp high256 (take iden)) (pair (comp high256 (drop iden)) (comp low256 (drop iden))) : (2 * 2^256) -> (2 * 2^256)
+
+-- Supply carry-in = 1 and discard carry-out. MAX + 1 therefore returns zero.
+export := comp (comp (pair (comp unit (const 0b1)) iden) increment256) (drop iden) : 2^256 -> 2^256

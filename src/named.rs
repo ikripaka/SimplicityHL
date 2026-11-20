@@ -600,6 +600,13 @@ impl<'brand, P: CoreExt<'brand>> PairBuilder<P> {
     ) -> Self {
         Self(P::unit_scribe(inference_context, value))
     }
+
+    /// Compose a `pair` value with a described node.
+    ///
+    /// Used for construction of a `pair` value out of input function parameters in a raw Simplicity.
+    pub(crate) fn from_node(node: P) -> Self {
+        Self(node)
+    }
 }
 
 impl<'brand, P: WitnessConstructible<'brand, TemplateProgramWitness>> PairBuilder<P> {

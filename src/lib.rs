@@ -15,6 +15,7 @@ pub mod named;
 pub mod num;
 pub mod parse;
 pub mod pattern;
+mod raw_simplicity;
 pub mod resolution;
 pub mod source;
 mod template_program;
@@ -46,6 +47,8 @@ use crate::debug::DebugSymbols;
 use crate::driver::{DependencyGraph, SourceMap, MAIN_MODULE};
 use crate::error::DiagnosticManager;
 use crate::parse::ParseFromStrWithErrors;
+use crate::raw_simplicity::LoadedRaw;
+pub use crate::raw_simplicity::{RawDependency, RawImport, RawOrigin, RawSource, RawSources};
 use crate::resolution::DependencyMap;
 use crate::source::CanonSourceFile;
 pub use crate::template_program::{TemplateProgram, TemplateProgramWitness};
@@ -67,6 +70,7 @@ pub struct TemplateAst {
     jet_hinter: Box<dyn ast::JetHinter>,
     diagnostics: DiagnosticManager,
     resolved_program: parse::Program,
+    loaded_raw: LoadedRaw,
 }
 
 impl TemplateAst {
@@ -81,17 +85,44 @@ impl TemplateAst {
         dependency_map: &DependencyMap,
         unstable_features: &UnstableFeatures,
     ) -> Result<String, DiagnosticManager> {
-        let (program, diagnostics) = DependencyGraph::build_program(
+        Self::flatten_with_raw_dependencies(source, dependency_map, unstable_features)
+            .map(|(text, _)| text)
+    }
+
+    /// Like [`flatten`](Self::flatten), and also returns the raw Simplicity files that `extern fn`
+    /// declarations refer to. Their paths in the flattened source are relative to the directory
+    /// of the entry file (see [`RawDependency`]).
+    ///
+    /// ## Errors
+    ///
+    /// The string is not a valid SimplicityHL program, or a raw file cannot be found.
+    pub fn flatten_with_raw_dependencies(
+        source: CanonSourceFile,
+        dependency_map: &DependencyMap,
+        unstable_features: &UnstableFeatures,
+    ) -> Result<(String, Vec<RawDependency>), DiagnosticManager> {
+        let (program, mut diagnostics) = DependencyGraph::build_program(
             source,
             Arc::from(dependency_map.clone()),
             unstable_features,
         );
 
-        let Some(resolved_program) = program else {
+        let Some(mut resolved_program) = program else {
             return Err(diagnostics);
         };
 
-        Ok(resolved_program.to_string())
+        let mut raw_dependencies = Vec::new();
+        if let Some(sources) = diagnostics.sources() {
+            match resolved_program.relativize_raw_paths(sources) {
+                Ok(deps) => raw_dependencies = deps,
+                Err(error) => {
+                    diagnostics.push(error);
+                    return Err(diagnostics);
+                }
+            }
+        }
+
+        Ok((resolved_program.to_string(), raw_dependencies))
     }
 
     /// Parse the template of a SimplicityHL program.
@@ -105,6 +136,28 @@ impl TemplateAst {
         unstable_features: &UnstableFeatures,
         jet_hinter: Box<dyn ast::JetHinter>,
     ) -> Result<Self, DiagnosticManager> {
+        Self::new_with_dep_and_raw_sources(
+            source,
+            dependency_map,
+            unstable_features,
+            jet_hinter,
+            &RawSources::from_disk(),
+        )
+    }
+
+    /// Like [`new_with_dep`](Self::new_with_dep), obtaining the raw files of `extern fn`
+    /// declarations through `raw_sources` ([`RawSources`]): given texts, given files, or read from disk.
+    ///
+    /// ## Errors
+    ///
+    /// The program is not valid, or a raw file is missing.
+    pub fn new_with_dep_and_raw_sources(
+        source: CanonSourceFile,
+        dependency_map: &DependencyMap,
+        unstable_features: &UnstableFeatures,
+        jet_hinter: Box<dyn ast::JetHinter>,
+        raw_sources: &RawSources,
+    ) -> Result<Self, DiagnosticManager> {
         let file = source.content();
         let (program, mut diagnostics) = DependencyGraph::build_program(
             source,
@@ -112,13 +165,16 @@ impl TemplateAst {
             unstable_features,
         );
 
-        let Some(resolved_program) = program else {
+        let Some(mut resolved_program) = program else {
             return Err(diagnostics);
         };
 
-        let Some(simfony) =
-            ast::Program::analyze(&resolved_program, jet_hinter.clone_box(), &mut diagnostics)
-        else {
+        let Some((simfony, loaded_raw)) = Self::analyze_with_raw_sources(
+            &mut resolved_program,
+            jet_hinter.as_ref(),
+            raw_sources,
+            &mut diagnostics,
+        ) else {
             return Err(diagnostics);
         };
 
@@ -128,6 +184,7 @@ impl TemplateAst {
             jet_hinter,
             diagnostics,
             resolved_program,
+            loaded_raw,
         })
     }
 
@@ -150,10 +207,26 @@ impl TemplateAst {
         unstable_features: &UnstableFeatures,
         jet_hinter: Box<dyn ast::JetHinter>,
     ) -> Result<Self, DiagnosticManager> {
-        let mut diagnostics = DiagnosticManager::default();
-        let file = s.into();
+        Self::new_with_raw_sources(s, unstable_features, jet_hinter, &RawSources::from_disk())
+    }
 
-        let Some(resolved_program) = parse::Program::parse_from_str_with_errors(
+    /// Like [`new_with_unstable`](Self::new_with_unstable), obtaining the raw files of `extern fn`
+    /// declarations through `raw_sources`. A source without a file has no directory, so its
+    /// relative paths need the files given by key ([`TemplateAst::declared_raw_paths`]).
+    ///
+    /// ## Errors
+    ///
+    /// The string is not a valid SimplicityHL program, or a raw file is missing.
+    pub fn new_with_raw_sources<Str: Into<Arc<str>>>(
+        s: Str,
+        unstable_features: &UnstableFeatures,
+        jet_hinter: Box<dyn ast::JetHinter>,
+        raw_sources: &RawSources,
+    ) -> Result<Self, DiagnosticManager> {
+        let file = s.into();
+        let mut diagnostics = DiagnosticManager::default();
+
+        let Some(mut resolved_program) = parse::Program::parse_from_str_with_errors(
             MAIN_MODULE,
             &file,
             unstable_features,
@@ -162,9 +235,12 @@ impl TemplateAst {
             return Err(diagnostics);
         };
 
-        let Some(simfony) =
-            ast::Program::analyze(&resolved_program, jet_hinter.clone_box(), &mut diagnostics)
-        else {
+        let Some((simfony, loaded_raw)) = Self::analyze_with_raw_sources(
+            &mut resolved_program,
+            jet_hinter.as_ref(),
+            raw_sources,
+            &mut diagnostics,
+        ) else {
             return Err(diagnostics);
         };
 
@@ -174,7 +250,62 @@ impl TemplateAst {
             jet_hinter,
             diagnostics,
             resolved_program,
+            loaded_raw,
         })
+    }
+
+    /// Give every `extern fn` of `program` its raw code, then analyze it. A raw file that
+    /// cannot be loaded is reported and stops before analysis.
+    fn analyze_with_raw_sources(
+        program: &mut parse::Program,
+        jet_hinter: &dyn ast::JetHinter,
+        raw_sources: &RawSources,
+        diagnostics: &mut DiagnosticManager,
+    ) -> Option<(ast::Program, raw_simplicity::LoadedRaw)> {
+        let sources = diagnostics.sources().cloned();
+        let raw = raw_simplicity::load_raw_code(
+            program,
+            sources.as_ref(),
+            raw_sources,
+            jet_hinter.clone_box(),
+            diagnostics,
+        )?;
+        let program = ast::Program::analyze(program, jet_hinter.clone_box(), diagnostics)?;
+
+        Some((program, raw))
+    }
+
+    /// The keys of the raw files a source without a file declares ([`RawSources`]), without
+    /// loading them: what to give [`new_with_raw_sources`](Self::new_with_raw_sources).
+    ///
+    /// ## Errors
+    ///
+    /// The string is not a valid SimplicityHL program.
+    pub fn declared_raw_paths(
+        s: &str,
+        unstable_features: &UnstableFeatures,
+    ) -> Result<Vec<Arc<str>>, DiagnosticManager> {
+        let mut diagnostics = DiagnosticManager::default();
+        let file: Arc<str> = Arc::from(s);
+        parse::Program::parse_from_str_with_errors(
+            MAIN_MODULE,
+            &file,
+            unstable_features,
+            &mut diagnostics,
+        )
+        .map(|program| program.raw_keys())
+        .ok_or(diagnostics)
+    }
+
+    /// The raw files the program loaded for its `extern fn` declarations, by key. Compiling the
+    /// same source with them reads nothing from disk.
+    pub fn raw_sources(&self) -> &RawSources {
+        &self.loaded_raw.sources
+    }
+
+    /// The raw entries the program imported: file key, entry and CMR, in declaration order.
+    pub fn raw_imports(&self) -> &[RawImport] {
+        &self.loaded_raw.imports
     }
 
     /// Access the parameters of the program.
@@ -273,14 +404,9 @@ impl CompiledProgram {
         include_debug_symbols: bool,
         jet_hinter: Box<dyn ast::JetHinter>,
     ) -> Result<Self, String> {
-        TemplateAst::new_with_dep(
-            source,
-            dependency_map,
-            unstable_features,
-            jet_hinter.clone_box(),
-        )
-        .map_err(|diagnostics| diagnostics.render_to_string())
-        .and_then(|template| template.instantiate(arguments, include_debug_symbols))
+        TemplateAst::new_with_dep(source, dependency_map, unstable_features, jet_hinter)
+            .map_err(|diagnostics| diagnostics.render_to_string())
+            .and_then(|template| template.instantiate(arguments, include_debug_symbols))
     }
 
     /// Parse and compile a SimplicityHL program from the given string.
@@ -295,13 +421,9 @@ impl CompiledProgram {
         include_debug_symbols: bool,
         jet_hinter: Box<dyn ast::JetHinter>,
     ) -> Result<Self, String> {
-        Self::new_with_unstable(
-            s,
-            &UnstableFeatures::none(),
-            arguments,
-            include_debug_symbols,
-            jet_hinter,
-        )
+        TemplateAst::new(s, jet_hinter)
+            .map_err(|error| error.to_string())
+            .and_then(|template| template.instantiate(arguments, include_debug_symbols))
     }
 
     /// Like [`new`](Self::new), but rejects any unstable feature used by the
@@ -313,7 +435,22 @@ impl CompiledProgram {
         include_debug_symbols: bool,
         jet_hinter: Box<dyn ast::JetHinter>,
     ) -> Result<Self, String> {
-        TemplateAst::new_with_unstable(s, unstable_features, jet_hinter.clone_box())
+        TemplateAst::new_with_unstable(s, unstable_features, jet_hinter)
+            .map_err(|error| error.to_string())
+            .and_then(|template| template.instantiate(arguments, include_debug_symbols))
+    }
+
+    /// Like [`new_with_unstable`](Self::new_with_unstable), resolving `extern fn` paths through
+    /// `raw_sources` ([`TemplateAst::new_with_raw_sources`]).
+    pub fn new_with_raw_sources<Str: Into<Arc<str>>>(
+        s: Str,
+        unstable_features: &UnstableFeatures,
+        raw_sources: &RawSources,
+        arguments: Arguments,
+        include_debug_symbols: bool,
+        jet_hinter: Box<dyn ast::JetHinter>,
+    ) -> Result<Self, String> {
+        TemplateAst::new_with_raw_sources(s, unstable_features, jet_hinter, raw_sources)
             .map_err(|error| error.to_string())
             .and_then(|template| template.instantiate(arguments, include_debug_symbols))
     }
@@ -429,14 +566,8 @@ impl SatisfiedProgram {
         include_debug_symbols: bool,
         jet_hinter: Box<dyn ast::JetHinter>,
     ) -> Result<Self, String> {
-        Self::new_with_unstable(
-            s,
-            &UnstableFeatures::none(),
-            arguments,
-            witness_values,
-            include_debug_symbols,
-            jet_hinter,
-        )
+        CompiledProgram::new(s, arguments, include_debug_symbols, jet_hinter)?
+            .satisfy(witness_values)
     }
 
     /// Like [`new`](Self::new), but rejects any unstable feature used by the

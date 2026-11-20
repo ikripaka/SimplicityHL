@@ -1,6 +1,6 @@
 use std::fmt;
 
-use chumsky::prelude::{any, choice, end, just, recursive, skip_then_retry_until};
+use chumsky::prelude::{any, choice, end, just, none_of, recursive, skip_then_retry_until};
 use chumsky::{error::Rich, extra, span::SimpleSpan, text, IterParser, Parser};
 
 use crate::driver::CRATE_STR;
@@ -21,6 +21,9 @@ pub enum Token<'src> {
     Use,
     As,
     Fn,
+    Extern,
+    Hash,
+    StringLiteral(&'src str),
     Let,
     Type,
     Mod,
@@ -153,6 +156,9 @@ impl<'src> fmt::Display for Token<'src> {
             Token::Pub => write!(f, "pub"),
             Token::Use => write!(f, "use"),
             Token::As => write!(f, "as"),
+            Token::Extern => write!(f, "extern"),
+            Token::Hash => write!(f, "#"),
+            Token::StringLiteral(s) => write!(f, "\"{s}\""),
             Token::Fn => write!(f, "fn"),
             Token::Let => write!(f, "let"),
             Token::Type => write!(f, "type"),
@@ -333,6 +339,7 @@ fn to_token<'src, const PRESERVE: bool>(
         "use" => Token::Use,
         "as" => Token::As,
         "fn" => Token::Fn,
+        "extern" => Token::Extern,
         "let" => Token::Let,
         "type" => Token::Type,
         "mod" => Token::Mod,
@@ -359,7 +366,13 @@ fn to_token<'src, const PRESERVE: bool>(
         .ignore_then(text::ident())
         .map(Token::Param);
 
+    let string = none_of("\"\\\n\r")
+        .repeated()
+        .to_slice()
+        .delimited_by(just('"'), just('"'))
+        .map(Token::StringLiteral);
     let op = choice((
+        just("#").to(Token::Hash),
         just("->").to(Token::Arrow),
         just("=>").to(Token::FatArrow),
         just("=").to(Token::Eq),
@@ -377,7 +390,9 @@ fn to_token<'src, const PRESERVE: bool>(
         just(">").to(Token::RAngle),
     ));
 
-    choice((jet, witness, param, macros, hex, bin, num, keyword, op))
+    choice((
+        jet, witness, param, macros, hex, bin, num, keyword, string, op,
+    ))
 }
 
 pub fn lexer<'src>(
@@ -524,8 +539,8 @@ fn filter_token<'src, F: Fn(SimpleSpan) -> Span>(
 
 /// A list of all reserved keywords.
 pub const KEYWORDS: &[&str] = &[
-    "pub", "use", "as", "fn", "let", "type", "mod", "const", "match", "enum", CRATE_STR, SIMC_STR,
-    "true", "false",
+    "pub", "use", "as", "fn", "extern", "let", "type", "mod", "const", "match", "enum", CRATE_STR,
+    SIMC_STR, "true", "false",
 ];
 
 /// Checks whether a given string is a keyword.

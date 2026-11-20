@@ -161,6 +161,7 @@ impl DependencyGraph {
             }
             parse::Item::TypeAlias(_)
             | parse::Item::Function(_)
+            | parse::Item::SimplicityFunction(_)
             | parse::Item::EnumDeclaration(_) => Some(item.clone()),
             parse::Item::Ignored => None,
         }

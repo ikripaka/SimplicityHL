@@ -1,6 +1,7 @@
 //! Compile the parsed ast into a simplicity program
 
 mod builtins;
+mod raw;
 mod scope_bindings;
 
 use std::sync::Arc;
@@ -13,8 +14,8 @@ use self::builtins::{array_fold, raw_hash};
 use self::scope_bindings::ScopeBindings;
 use crate::array::{BTreeSlice, Partition};
 use crate::ast::{
-    Call, CallName, EnumMatch, Expression, ExpressionInner, JetHinter, Match, Program,
-    SingleExpression, SingleExpressionInner, Statement,
+    Call, CallName, EnumMatch, Expression, ExpressionInner, FunctionDefinition, JetHinter, Match,
+    Program, SingleExpression, SingleExpressionInner, Statement,
 };
 use crate::debug::CallTracker;
 use crate::error::{Diagnostic, Error, Span, WithSpan};
@@ -408,6 +409,24 @@ impl SingleExpression {
     }
 }
 
+impl FunctionDefinition {
+    fn compile<'brand>(
+        &self,
+        scope: &Scope<'brand>,
+    ) -> Result<PairBuilder<ProgNode<'brand>>, Diagnostic> {
+        match self {
+            Self::Ordinary(function) => {
+                let mut function_scope = scope.child(function.params_pattern());
+                function.body().compile(&mut function_scope)
+            }
+            Self::Extern(function) => {
+                let imported_function = raw::import(function.body(), scope.ctx());
+                Ok(PairBuilder::from_node(imported_function))
+            }
+        }
+    }
+}
+
 impl Call {
     fn compile<'brand>(
         &self,
@@ -474,15 +493,19 @@ impl Call {
                 let body = function.body().compile(&mut function_scope)?;
                 args.comp(&body).with_span(self)
             }
+            CallName::Extern(function) => {
+                let imported_function = raw::import(function.body(), scope.ctx());
+
+                let body = PairBuilder::from_node(imported_function);
+                args.comp(&body).with_span(self)
+            }
             CallName::Fold(function, bound) => {
-                let mut function_scope = scope.child(function.params_pattern());
-                let body = function.body().compile(&mut function_scope)?;
+                let body = function.compile(scope)?;
                 let fold_body = list_fold(*bound, body.as_ref()).with_span(self)?;
                 args.comp(&fold_body).with_span(self)
             }
             CallName::ArrayFold(function, size) => {
-                let mut function_scope = scope.child(function.params_pattern());
-                let body = function.body().compile(&mut function_scope)?;
+                let body = function.compile(scope)?;
                 let fold_body = array_fold(*size, body.as_ref()).with_span(self)?;
                 args.comp(&fold_body).with_span(self)
             }
@@ -491,8 +514,7 @@ impl Call {
                 scope.with_debug_symbol(args, &body, self)
             }
             CallName::ForWhile(function, bit_width) => {
-                let mut function_scope = scope.child(function.params_pattern());
-                let body = function.body().compile(&mut function_scope)?;
+                let body = function.compile(scope)?;
                 let fold_body = for_while(*bit_width, body).with_span(self)?;
                 args.comp(&fold_body).with_span(self)
             }
