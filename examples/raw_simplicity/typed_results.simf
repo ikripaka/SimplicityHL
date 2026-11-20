@@ -1,0 +1,19 @@
+simc "*";
+
+#[path = "identity.simpl"]
+extern fn raw_identity(x: u256) -> u256;
+
+#[path = "choose.simpl"]
+extern fn raw_choose(x: u256) -> Either<u256, u32>;
+
+fn main() {
+    let x: u256 = witness::X;
+    let incremented: u256 = raw_identity(x);
+    assert!(jet::eq_256(incremented, witness::EXPECTED_INCREMENT));
+
+    let expected: Either<u256, u32> = witness::EXPECTED_CHOICE;
+    match raw_choose(x) {
+        Left(full: u256) => assert!(jet::eq_256(full, unwrap_left::<u32>(expected))),
+        Right(low: u32) => assert!(jet::eq_32(low, unwrap_right::<u256>(expected))),
+    }
+}

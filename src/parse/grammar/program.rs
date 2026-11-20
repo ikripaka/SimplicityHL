@@ -11,8 +11,8 @@ use crate::str::{FunctionName, Identifier, ModuleName, SymbolName};
 use crate::types::AliasedType;
 
 use super::super::{
-    EnumDeclaration, Expression, Function, FunctionParam, Item, Module, Program, TypeAlias,
-    UseDecl, UseItems, Visibility,
+    EnumDeclaration, Expression, Function, FunctionParam, FunctionSignature, Item, Module, Program,
+    SimplicityFunction, TypeAlias, UseDecl, UseItems, Visibility,
 };
 use super::{delimited_with_recovery, ChumskyParse, ParseError};
 
@@ -36,6 +36,7 @@ impl ChumskyParse for Program {
                             Token::Pub
                                 | Token::Use
                                 | Token::Fn
+                                | Token::Hash
                                 | Token::Type
                                 | Token::Mod
                                 | Token::Enum
@@ -62,6 +63,7 @@ impl ChumskyParse for Item {
         I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
     {
         recursive(|item| {
+            let simplicity_func_parser = SimplicityFunction::parser().map(Item::SimplicityFunction);
             let func_parser = Function::parser().map(Item::Function);
             let type_parser = TypeAlias::parser().map(Item::TypeAlias);
             let use_parser = UseDecl::parser().map(Item::Use);
@@ -71,6 +73,7 @@ impl ChumskyParse for Item {
             let mod_parser = Module::parser_with_items(item).map(Item::Module);
 
             choice((
+                simplicity_func_parser,
                 func_parser,
                 use_parser,
                 type_parser,
@@ -81,17 +84,23 @@ impl ChumskyParse for Item {
     }
 }
 
-impl ChumskyParse for Function {
+fn function_visibility<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, Visibility, ParseError<'src>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    just(Token::Pub)
+        .to(Visibility::Public)
+        .or_not()
+        .map(Option::unwrap_or_default)
+        .labelled("function visibility")
+}
+
+impl ChumskyParse for FunctionSignature {
     fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
     where
         I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
     {
-        let visibility = just(Token::Pub)
-            .to(Visibility::Public)
-            .or_not()
-            .map(Option::unwrap_or_default)
-            .labelled("function visibility");
-
         let params = delimited_with_recovery(
             FunctionParam::parser()
                 .separated_by(just(Token::Comma))
@@ -109,6 +118,19 @@ impl ChumskyParse for Function {
             .or_not()
             .labelled("return type");
 
+        just(Token::Fn)
+            .ignore_then(FunctionName::parser())
+            .then(params)
+            .then(ret)
+            .map(|((name, params), ret)| Self { name, params, ret })
+    }
+}
+
+impl ChumskyParse for Function {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
         let body = just(Token::LBrace)
             .rewind()
             .ignore_then(Expression::parser())
@@ -123,18 +145,40 @@ impl ChumskyParse for Function {
             )))
             .labelled("function body");
 
-        visibility
-            .then_ignore(just(Token::Fn))
-            .then(FunctionName::parser())
-            .then(params)
-            .then(ret)
+        function_visibility()
+            .then(FunctionSignature::parser())
             .then(body)
-            .map_with(|((((visibility, name), params), ret), body), e| Self {
+            .map_with(|((visibility, signature), body), e| Self {
                 visibility,
-                name,
-                params,
-                ret,
+                signature,
                 body,
+                span: e.span(),
+            })
+    }
+}
+
+impl ChumskyParse for SimplicityFunction {
+    fn parser<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Self, ParseError<'src>> + Clone
+    where
+        I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    {
+        let string = select! { Token::StringLiteral(s) => Arc::<str>::from(s) };
+        let attribute = just(Token::Hash)
+            .ignore_then(just(Token::LBracket))
+            .ignore_then(just(Token::Ident("path")))
+            .ignore_then(just(Token::Eq))
+            .ignore_then(string)
+            .then_ignore(just(Token::RBracket));
+        attribute
+            .then(function_visibility())
+            .then_ignore(just(Token::Extern))
+            .then(FunctionSignature::parser())
+            .then_ignore(just(Token::Semi))
+            .map_with(|((path, visibility), signature), e| Self {
+                visibility,
+                signature,
+                path,
+                code: None,
                 span: e.span(),
             })
     }

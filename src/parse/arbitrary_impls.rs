@@ -10,8 +10,9 @@ use crate::TemplateProgramWitness;
 
 use super::{
     Assignment, Call, CallName, EnumDeclaration, EnumVariant, Expression, ExpressionInner,
-    Function, FunctionParam, Item, Match, MatchArm, MatchPattern, Module, Program,
-    SingleExpression, SingleExpressionInner, Statement, TypeAlias, UseDecl, UseItems, Visibility,
+    Function, FunctionParam, FunctionSignature, Item, Match, MatchArm, MatchPattern, Module,
+    Program, SingleExpression, SingleExpressionInner, Statement, TypeAlias, UseDecl, UseItems,
+    Visibility,
 };
 
 impl<'a> arbitrary::Arbitrary<'a> for UseDecl {
@@ -107,14 +108,14 @@ impl<'a> arbitrary::Arbitrary<'a> for Program {
             0 => {}
             1 => {
                 let mut main_fn = <Function as crate::ArbitraryRec>::arbitrary_rec(u, 3)?;
-                main_fn.name = FunctionName::main();
+                main_fn.signature.name = FunctionName::main();
                 items_vec.push(Item::Function(main_fn));
             }
             _ => {
                 let mut main_fn = <Function as crate::ArbitraryRec>::arbitrary_rec(u, 3)?;
-                main_fn.name = FunctionName::main();
-                main_fn.params = Arc::from([]);
-                main_fn.ret = None;
+                main_fn.signature.name = FunctionName::main();
+                main_fn.signature.params = Arc::from([]);
+                main_fn.signature.ret = None;
                 items_vec.push(Item::Function(main_fn));
             }
         }
@@ -159,9 +160,7 @@ impl crate::ArbitraryRec for Function {
         let body = Expression::arbitrary_rec(u, budget).map(Expression::into_block)?;
         Ok(Self {
             visibility,
-            name,
-            params,
-            ret,
+            signature: FunctionSignature { name, params, ret },
             body,
             span: Span::DUMMY,
         })

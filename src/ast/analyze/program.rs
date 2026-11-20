@@ -2,14 +2,19 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::driver::MAIN_STR;
-use crate::error::{DiagnosticManager, Error, WithSpan};
+use crate::error::{DiagnosticManager, Error, Span, WithSpan};
 use crate::parse::{self, Visibility};
 use crate::str::FunctionName;
-use crate::types::{EnumVariantInfo, ResolvedType, TypeConstructible, TypeDeconstructible};
+use crate::types::{
+    AliasedType, EnumVariantInfo, ResolvedType, TypeConstructible, TypeDeconstructible,
+};
 
 use super::super::recovery::Failure;
 use super::super::scope::Scope;
-use super::super::{CustomFunction, Expression, Function, FunctionParam, Item, JetHinter, Program};
+use super::super::{
+    CustomFunction, Expression, ExternFunction, Function, FunctionDefinition, FunctionParam, Item,
+    JetHinter, Program,
+};
 use super::AbstractSyntaxTree;
 
 impl Program {
@@ -82,11 +87,10 @@ impl Program {
 impl Item {
     /// Analyze the items of a module in order.
     fn analyze_items(from: &[parse::Item], scope: &mut Scope) -> Result<Vec<Self>, Failure> {
-        let unit = ResolvedType::unit();
         let mut items = Vec::with_capacity(from.len());
 
         for item in from {
-            match Self::analyze(item, &unit, scope) {
+            match Self::analyze(item, scope) {
                 Ok(item) => items.push(item),
                 Err(failure) if matches!(item, parse::Item::Function(f) if f.name() == MAIN_STR) => {
                     scope.report(failure);
@@ -97,13 +101,8 @@ impl Item {
 
         Ok(items)
     }
-}
 
-impl AbstractSyntaxTree for Item {
-    type From = parse::Item;
-
-    fn analyze(from: &Self::From, ty: &ResolvedType, scope: &mut Scope) -> Result<Self, Failure> {
-        assert!(ty.is_unit(), "Items cannot return anything");
+    fn analyze(from: &parse::Item, scope: &mut Scope) -> Result<Self, Failure> {
         assert!(
             scope.is_outside_function(),
             "Variables live only inside the function"
@@ -112,10 +111,16 @@ impl AbstractSyntaxTree for Item {
         match from {
             parse::Item::TypeAlias(alias) => {
                 scope.insert_alias(alias.clone()).with_span(alias)?;
+
                 Ok(Self::TypeAlias)
             }
             parse::Item::Function(function) => {
-                Function::analyze(function, ty, scope).map(Self::Function)
+                Function::analyze(function, &ResolvedType::unit(), scope).map(Self::Function)
+            }
+            parse::Item::SimplicityFunction(function) => {
+                ExternFunction::analyze(function, &ResolvedType::unit(), scope)?;
+
+                Ok(Self::ExternFunction)
             }
             parse::Item::Use(use_decl) => {
                 scope.resolve_use(use_decl).with_span(use_decl)?;
@@ -169,7 +174,7 @@ impl AbstractSyntaxTree for Item {
                 .in_module(
                     module.name().clone(),
                     module.visibility().clone(),
-                    |scope| Item::analyze_items(module.items(), scope).map(Self::Module),
+                    |scope| Self::analyze_items(module.items(), scope).map(Self::Module),
                 )
                 .with_span(module)?,
             parse::Item::Ignored => Ok(Self::Ignored),
@@ -188,47 +193,16 @@ impl AbstractSyntaxTree for Function {
         );
 
         if from.name() != MAIN_STR {
-            let mut seen_params = HashSet::new();
-
-            // A broken type in the signature becomes `!`, so the function is still
-            // registered and its calls do not report it as undefined.
-            let params = from
-                .params()
-                .iter()
-                .map(|param| {
-                    if !seen_params.insert(param.identifier()) {
-                        scope.report(
-                            Error::ParameterRedefined {
-                                identifier: param.identifier().clone(),
-                            }
-                            .with_span(*param.span()),
-                        );
+            let (params, ret) = analyze_signature(from.params(), from.ret(), *from.span(), scope);
+            let body = scope
+                .in_function(|scope| {
+                    for param in params.iter() {
+                        scope.insert_variable(param.identifier().clone(), param.ty().clone());
                     }
-
-                    FunctionParam {
-                        identifier: param.identifier().clone(),
-                        ty: scope.resolve_or_never(param.ty(), from),
-                        span: *param.span(),
-                    }
+                    Expression::analyze(from.body(), &ret, scope).map(Arc::new)
                 })
-                .collect::<Arc<[FunctionParam]>>();
-            let ret = from
-                .ret()
-                .as_ref()
-                .map_or_else(ResolvedType::unit, |aliased| {
-                    scope.resolve_or_never(aliased, from)
-                });
-
-            let body = scope.in_function(|scope| {
-                for param in params.iter() {
-                    scope.insert_variable(param.identifier().clone(), param.ty().clone());
-                }
-                Expression::analyze(from.body(), &ret, scope).map(Arc::new)
-            });
-
-            // A broken body does not change the declared signature,
-            // so later items can still call the function.
-            let body = body.map_err(|failure| scope.report(failure)).ok();
+                .map_err(|failure| scope.report(failure))
+                .ok();
             let function = CustomFunction {
                 params,
                 ret,
@@ -236,7 +210,11 @@ impl AbstractSyntaxTree for Function {
                 span: *from.span(),
             };
             scope
-                .insert_function(from.name().clone(), from.visibility().clone(), function)
+                .insert_function(
+                    from.name().clone(),
+                    from.visibility().clone(),
+                    FunctionDefinition::Ordinary(function),
+                )
                 .with_span(from)?;
 
             return Ok(Self::Custom);
@@ -260,4 +238,86 @@ impl AbstractSyntaxTree for Function {
         let body = scope.in_main(|scope| Expression::analyze(from.body(), ty, scope))?;
         Ok(Self::Main(body))
     }
+}
+
+impl AbstractSyntaxTree for ExternFunction {
+    type From = parse::SimplicityFunction;
+
+    fn analyze(from: &Self::From, ty: &ResolvedType, scope: &mut Scope) -> Result<Self, Failure> {
+        assert!(ty.is_unit(), "Function definitions cannot return anything");
+        assert!(
+            scope.is_outside_function(),
+            "Variables live only inside the function"
+        );
+
+        if from.name() == MAIN_STR {
+            return Err(Error::Simplicity {
+                msg: "main must have a SimplicityHL body".into(),
+            })
+            .with_span(from)?;
+        }
+
+        let (params, ret) = analyze_signature(from.params(), from.ret(), *from.span(), scope);
+        if !ret.has_structural_type() || params.iter().any(|p| !p.ty().has_structural_type()) {
+            return Err(Failure::Reported);
+        }
+
+        let code = from
+            .code()
+            .ok_or_else(|| Error::Simplicity {
+                msg: "the raw Simplicity of this `extern fn` was not loaded".into(),
+            })
+            .with_span(from)?;
+
+        let input = ResolvedType::tuple(params.iter().map(|param| param.ty().clone()));
+        code.check_signature(&input, &ret).with_span(from)?;
+
+        let function = Self {
+            params,
+            ret,
+            body: Arc::clone(code.root()),
+            span: *from.span(),
+        };
+        scope
+            .insert_function(
+                from.name().clone(),
+                from.visibility().clone(),
+                FunctionDefinition::Extern(function.clone()),
+            )
+            .with_span(from)?;
+
+        Ok(function)
+    }
+}
+
+fn analyze_signature(
+    params: &[parse::FunctionParam],
+    ret: Option<&AliasedType>,
+    span: Span,
+    scope: &mut Scope,
+) -> (Arc<[FunctionParam]>, ResolvedType) {
+    let mut seen_params = HashSet::new();
+
+    // Resolve broken types to `!` so the rest of the signature can still be checked.
+    let params = params
+        .iter()
+        .map(|param| {
+            if !seen_params.insert(param.identifier()) {
+                scope.report(
+                    Error::ParameterRedefined {
+                        identifier: param.identifier().clone(),
+                    }
+                    .with_span(*param.span()),
+                );
+            }
+
+            FunctionParam {
+                identifier: param.identifier().clone(),
+                ty: scope.resolve_or_never(param.ty(), span),
+                span: *param.span(),
+            }
+        })
+        .collect();
+    let ret = ret.map_or_else(ResolvedType::unit, |ty| scope.resolve_or_never(ty, span));
+    (params, ret)
 }

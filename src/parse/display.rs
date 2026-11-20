@@ -5,8 +5,9 @@ use miniscript::iter::TreeLike;
 
 use super::{
     Assignment, Call, CallName, EnumDeclaration, EnumMatch, EnumMatchArm, ExprTree, Expression,
-    Function, FunctionParam, Item, Match, MatchPattern, Module, Program, SingleExpression,
-    SingleExpressionInner, Statement, TypeAlias, UseDecl, UseItems, Visibility,
+    Function, FunctionParam, FunctionSignature, Item, Match, MatchPattern, Module, Program,
+    SimplicityFunction, SingleExpression, SingleExpressionInner, Statement, TypeAlias, UseDecl,
+    UseItems, Visibility,
 };
 
 impl fmt::Display for EnumDeclaration {
@@ -64,6 +65,7 @@ impl fmt::Display for Item {
         match self {
             Self::TypeAlias(alias) => write!(f, "{alias}"),
             Self::Function(function) => write!(f, "{function}"),
+            Self::SimplicityFunction(function) => write!(f, "{function}"),
             Self::Use(use_declaration) => write!(f, "{use_declaration}"),
             Self::EnumDeclaration(decl) => write!(f, "{decl}"),
             Self::Module(module) => write!(f, "{module}"),
@@ -95,18 +97,31 @@ impl fmt::Display for TypeAlias {
 
 impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}fn {}(", self.visibility(), self.name())?;
-        for (i, param) in self.params().iter().enumerate() {
+        write!(f, "{}{} {}", self.visibility(), self.signature, self.body())
+    }
+}
+
+impl fmt::Display for SimplicityFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "#[path = \"{}\"]", self.path())?;
+        write!(f, "{}extern {};", self.visibility(), self.signature)
+    }
+}
+
+impl fmt::Display for FunctionSignature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "fn {}(", self.name)?;
+        for (i, param) in self.params.iter().enumerate() {
             if 0 < i {
                 write!(f, ", ")?;
             }
             write!(f, "{param}")?;
         }
         write!(f, ")")?;
-        if let Some(ty) = self.ret() {
+        if let Some(ty) = &self.ret {
             write!(f, " -> {ty}")?;
         }
-        write!(f, " {}", self.body())
+        Ok(())
     }
 }
 

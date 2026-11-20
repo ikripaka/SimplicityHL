@@ -4,12 +4,13 @@ pub mod elements;
 
 use crate::num::NonZeroPow2Usize;
 use crate::num::Pow2Usize;
+use crate::parse::SimplicityParser;
 use crate::types::*;
 
 use simplicity::jet::DynJet;
 use simplicity::jet::Jet;
 
-pub trait JetHL: DynJet + Jet + std::fmt::Debug + Send + Sync + 'static {
+pub trait JetHL: DynJet + Jet + SimplicityParser + std::fmt::Debug + Send + Sync + 'static {
     fn source_jet_classification(&self) -> SourceJetClassification;
     fn target_jet_classification(&self) -> TargetJetClassification;
     fn is_disabled(&self) -> bool;
