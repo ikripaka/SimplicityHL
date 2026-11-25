@@ -2,7 +2,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ast::CustomFunction;
+use crate::ast::FunctionDefinition;
 use crate::driver::{CRATE_STR, MAIN_STR};
 use crate::error::Error;
 use crate::parse::{self, UseDecl, Visibility};
@@ -13,7 +13,7 @@ use crate::types::{AliasedType, EnumInfo, EnumVariantInfo, ResolvedType};
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 struct ModuleScope {
     aliases: HashMap<AliasName, (ResolvedType, Visibility)>,
-    functions: HashMap<FunctionName, (CustomFunction, Visibility)>,
+    functions: HashMap<FunctionName, (FunctionDefinition, Visibility)>,
     /// Nested inling `mod` blocks, each becoming a child scope.
     submodules: HashMap<ModuleName, (ModuleScope, Visibility)>,
 }
@@ -154,7 +154,7 @@ impl ModuleTree {
         Ok(())
     }
 
-    /// Insert a custom function into the global map.
+    /// Insert a function into the current module.
     ///
     /// ## Errors
     ///
@@ -163,7 +163,7 @@ impl ModuleTree {
         &mut self,
         name: FunctionName,
         visibility: Visibility,
-        function: CustomFunction,
+        function: FunctionDefinition,
     ) -> Result<(), Error> {
         if self.current().functions.contains_key(&name) {
             return Err(Error::FunctionRedefined { name });
@@ -175,12 +175,12 @@ impl ModuleTree {
         Ok(())
     }
 
-    /// Retrieves the definition of a custom function, enforcing strict error prioritization.
+    /// Retrieve the definition of a function from the current module.
     ///
     /// ## Errors
     ///
     /// * [`Error::FunctionUndefined`]: The function is not found in the global registry.
-    pub(super) fn get_function(&self, name: &FunctionName) -> Result<CustomFunction, Error> {
+    pub(super) fn get_function(&self, name: &FunctionName) -> Result<FunctionDefinition, Error> {
         self.current()
             .functions
             .get(name)

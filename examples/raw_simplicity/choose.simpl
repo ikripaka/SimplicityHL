@@ -1,0 +1,9 @@
+-- First bit = most significant bit of the big-endian u256.
+-- Anchor the complete input type before projecting individual parts.
+word := iden : 2^256 -> 2^256
+first_bit := comp word (comp (take take iden) jet_leftmost_64_1) : 2^256 -> 2
+last32 := comp word (drop drop drop iden) : 2^256 -> 2^32
+
+-- case receives (tag, original value); each branch drops the tag's unit payload.
+-- 0 => Left(original value), 1 => Right(low 32 bits).
+export := comp (pair first_bit iden) (case (drop injl iden) (drop injr last32)) : 2^256 -> (2^256 + 2^32)

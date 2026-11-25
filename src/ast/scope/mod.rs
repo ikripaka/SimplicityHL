@@ -5,7 +5,9 @@ mod program_inputs;
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use crate::ast::recovery::{mentions_never, Failure};
 use crate::ast::scope::modules::ModuleTree;
+use crate::ast::{ElementsJetHinter, Expression, FunctionDefinition, JetHinter, Program};
 use crate::debug::TrackedCallName;
 use crate::error::{Diagnostic, DiagnosticManager, Error, Span};
 use crate::parse::{self, UseDecl, Visibility};
@@ -15,8 +17,6 @@ use crate::TemplateProgramWitness;
 
 use self::locals::Locals;
 use self::program_inputs::ProgramInputs;
-use super::recovery::{mentions_never, Failure};
-use super::{CustomFunction, ElementsJetHinter, Expression, JetHinter, Program};
 
 /// Scope for generating the abstract syntax tree.
 ///
@@ -283,12 +283,12 @@ impl Scope {
         &mut self,
         name: FunctionName,
         visibility: Visibility,
-        function: CustomFunction,
+        function: FunctionDefinition,
     ) -> Result<(), Error> {
         self.modules.insert_function(name, visibility, function)
     }
 
-    pub(super) fn get_function(&self, name: &FunctionName) -> Result<CustomFunction, Error> {
+    pub(super) fn get_function(&self, name: &FunctionName) -> Result<FunctionDefinition, Error> {
         self.modules.get_function(name)
     }
 

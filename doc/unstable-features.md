@@ -11,6 +11,15 @@ Run `simc --help`; the features are listed under the `-Z` flag.
 
 Pass `-Z <feature-name>` to `simc`.
 
+## `simplicity`
+
+An external function can call a closed raw Simplicity entry from a disk file:
+
+```rust
+#[path = "equal32.simpl"]
+extern fn raw_equal32(a: u32, b: u32) -> bool;
+```
+
 ## `raw_hash`
 
 `raw_hash::<T>(tuple)` hashes a tuple of unsigned integers with SHA-256:

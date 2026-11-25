@@ -84,6 +84,8 @@ pub enum Item {
     EnumDeclaration,
     /// A function.
     Function(Function),
+    /// An external declaration of Simplicity function that was resolved into scope during analysis.
+    ExternFunction,
     Use,
     Module(Vec<Item>),
     /// A placeholder used for error recovery during parsing.
@@ -314,12 +316,14 @@ pub enum CallName {
     /// We effectively copy the function body into every call of the function.
     /// We use [`Arc`] for cheap clones during this process.
     Custom(CustomFunction),
+    /// An external function implemented in raw Simplicity.
+    Extern(ExternFunction),
     /// Fold of a bounded list with the given function.
-    Fold(CustomFunction, NonZeroPow2Usize),
+    Fold(FunctionDefinition, NonZeroPow2Usize),
     /// Fold of an array with the given function.
-    ArrayFold(CustomFunction, NonZeroUsize),
+    ArrayFold(FunctionDefinition, NonZeroUsize),
     /// Loop over the given function a bounded number of times until it returns success.
-    ForWhile(CustomFunction, Pow2Usize),
+    ForWhile(FunctionDefinition, Pow2Usize),
     /// SHA-256 of the concatenated bytes of a tuple of unsigned integers of the given type,
     /// using the given jets.
     RawHash(ResolvedType, RawHashJets),
@@ -341,6 +345,7 @@ impl PartialEq for CallName {
             (Self::Debug, Self::Debug) => true,
             (Self::TypeCast(a), Self::TypeCast(b)) => a == b,
             (Self::Custom(a), Self::Custom(b)) => a == b,
+            (Self::Extern(a), Self::Extern(b)) => a == b,
             (Self::Fold(a, b), Self::Fold(c, d)) => a == c && b == d,
             (Self::ArrayFold(a, b), Self::ArrayFold(c, d)) => a == c && b == d,
             (Self::ForWhile(a, b), Self::ForWhile(c, d)) => a == c && b == d,
@@ -375,14 +380,13 @@ impl CustomFunction {
     ///
     /// ## Panics
     ///
-    /// Panics if the analysis of the body failed. This cannot happen for a function
-    /// of an analyzed [`Program`], because a program with errors is never built.
+    /// Panics if analysis failed. Programs with analysis errors are never built.
     pub fn body(&self) -> &Expression {
         self.analyzed_body()
             .expect("programs with errors are never built")
     }
 
-    /// Access the body of the function, if its analysis succeeded.
+    /// Access the HL body if its analysis succeeded.
     fn analyzed_body(&self) -> Option<&Expression> {
         self.body.as_deref()
     }
@@ -405,6 +409,72 @@ impl CustomFunction {
 }
 
 impl_eq_hash!(CustomFunction; params, ret, analyzed_body);
+
+/// Definition of an external raw Simplicity function.
+#[derive(Clone, Debug)]
+pub struct ExternFunction {
+    params: Arc<[FunctionParam]>,
+    ret: ResolvedType,
+    body: Arc<simplicity::CommitNode>,
+    span: Span,
+}
+
+impl ExternFunction {
+    /// Access the declared parameters.
+    pub fn params(&self) -> &[FunctionParam] {
+        &self.params
+    }
+
+    /// Access the declared return type.
+    pub fn ret(&self) -> &ResolvedType {
+        &self.ret
+    }
+
+    /// Access the checked raw Simplicity implementation.
+    pub fn body(&self) -> &simplicity::CommitNode {
+        &self.body
+    }
+
+    /// Access the span of the complete external declaration.
+    pub fn span(&self) -> &Span {
+        &self.span
+    }
+}
+
+impl_eq_hash!(ExternFunction; params, ret, body);
+
+/// A function available by name or as the callback of a fold or loop.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum FunctionDefinition {
+    Ordinary(CustomFunction),
+    Extern(ExternFunction),
+}
+
+impl FunctionDefinition {
+    /// Access the declared parameters.
+    pub fn params(&self) -> &[FunctionParam] {
+        match self {
+            Self::Ordinary(function) => function.params(),
+            Self::Extern(function) => function.params(),
+        }
+    }
+
+    /// Access the declared return type.
+    pub fn ret(&self) -> &ResolvedType {
+        match self {
+            Self::Ordinary(function) => function.ret(),
+            Self::Extern(function) => function.ret(),
+        }
+    }
+
+    /// Access the span of the declaration.
+    pub fn span(&self) -> &Span {
+        match self {
+            Self::Ordinary(function) => function.span(),
+            Self::Extern(function) => function.span(),
+        }
+    }
+}
 
 /// Parameter of a function.
 #[derive(Clone, Debug)]
@@ -680,6 +750,12 @@ impl AsRef<Span> for FunctionParam {
 }
 
 impl AsRef<Span> for CustomFunction {
+    fn as_ref(&self) -> &Span {
+        &self.span
+    }
+}
+
+impl AsRef<Span> for ExternFunction {
     fn as_ref(&self) -> &Span {
         &self.span
     }

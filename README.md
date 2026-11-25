@@ -71,6 +71,10 @@ Produce JSON output with the `--json` flag.
 ./target/debug/simc examples/p2pkh.simf -w examples/p2pkh.wit --json
 ```
 
+### Experimental raw Simplicity functions
+
+Use `-Z simplicity` to call a typed function implemented in an external `.simpl` file.
+
 ### Editor tooling
 
 The language server and VS Code extension are maintained in separate repositories:

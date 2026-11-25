@@ -69,6 +69,8 @@ coverage! {
     ArraySizeNonZero => Tested,
     ListBoundPow2 => Tested,
     BitStringPow2 => Tested,
+    Simplicity => Elsewhere("tests/raw_simplicity.rs: invalid_declarations_fail_even_when_unused"),
+    SimplicityTypeMismatch => Elsewhere("tests/raw_simplicity.rs: structured_signature_mismatches"),
     CannotParse => Tested,
     Grammar => Tested,
     Syntax => Tested,

@@ -8,6 +8,7 @@ mod grammar;
 #[cfg(feature = "fmt")]
 mod lossless;
 mod pipeline;
+mod simplicity;
 #[cfg(test)]
 mod tests;
 
@@ -22,6 +23,7 @@ use crate::error::{Diagnostic, Error, Span};
 use crate::impl_eq_hash;
 use crate::num::NonZeroPow2Usize;
 use crate::pattern::Pattern;
+use crate::raw_simplicity::RawCode;
 use crate::str::{
     AliasName, Binary, Decimal, FunctionName, Hexadecimal, Identifier, JetName, ModuleName,
     SymbolName,
@@ -34,6 +36,7 @@ pub use self::grammar::ChumskyParse;
 #[cfg(feature = "fmt")]
 pub use self::lossless::ParsedSource;
 pub use self::pipeline::{ParseFromStr, ParseFromStrWithErrors};
+pub use self::simplicity::{parse_export, parse_simplicity, SimplicityParser};
 
 /// A program is a sequence of items.
 #[derive(Clone, Debug)]
@@ -51,6 +54,54 @@ impl Program {
         }
     }
 
+    /// Call `f` on every `extern fn` declaration, in declaration order.
+    pub(crate) fn for_each_extern_function_mut(
+        &mut self,
+        mut f: impl FnMut(&mut SimplicityFunction),
+    ) {
+        fn visit(items: &mut [Item], f: &mut impl FnMut(&mut SimplicityFunction)) {
+            for item in items {
+                match item {
+                    Item::SimplicityFunction(function) => f(function),
+                    Item::Module(module) => visit(Arc::make_mut(&mut module.items), f),
+                    Item::TypeAlias(_)
+                    | Item::Function(_)
+                    | Item::Use(_)
+                    | Item::EnumDeclaration(_)
+                    | Item::Ignored => {}
+                }
+            }
+        }
+
+        visit(Arc::make_mut(&mut self.items), &mut f);
+    }
+
+    /// The keys of the raw files the `extern fn` declarations of a source without a file name:
+    /// their declared paths, once each, in order.
+    pub(crate) fn raw_keys(&self) -> Vec<Arc<str>> {
+        fn visit(items: &[Item], out: &mut Vec<Arc<str>>) {
+            for item in items {
+                match item {
+                    Item::SimplicityFunction(function) => {
+                        let key = Arc::clone(&function.path);
+
+                        if !out.contains(&key) {
+                            out.push(key);
+                        }
+                    }
+                    Item::Module(module) => visit(module.items(), out),
+                    _ => {}
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+
+        visit(&self.items, &mut out);
+
+        out
+    }
+
     /// Access the items of the program.
     pub fn items(&self) -> &[Item] {
         &self.items
@@ -66,8 +117,10 @@ impl_require_feature!(Program { recurse: items; });
 pub enum Item {
     /// A type alias.
     TypeAlias(TypeAlias),
-    /// A function.
+    /// A SimplicityHL function definition.
     Function(Function),
+    /// An external raw Simplicity function declaration.
+    SimplicityFunction(SimplicityFunction),
     /// An import declaration (e.g., `use math::add`) that brings another
     /// [`Item`] into the current scope.
     Use(UseDecl),
@@ -90,6 +143,7 @@ impl Item {
         match self {
             Self::TypeAlias(alias) => Some(alias.span()),
             Self::Function(function) => Some(function.span()),
+            Self::SimplicityFunction(function) => Some(function.span()),
             Self::Use(use_decl) => Some(use_decl.span()),
             Self::EnumDeclaration(declaration) => Some(declaration.span()),
             Self::Module(module) => Some(module.span()),
@@ -98,15 +152,19 @@ impl Item {
     }
 }
 
-impl_require_feature!(Item {
-    variants:
-        TypeAlias(alias),
-        Function(function),
-        Use(use_decl),
-        EnumDeclaration(decl),
-        Module(module),
-        Ignored,
-});
+impl RequireFeature for Item {
+    fn feature_requirements(&self, out: &mut Vec<FeatureRequirement>) {
+        match self {
+            Self::TypeAlias(alias) => alias.feature_requirements(out),
+            Self::Function(function) => function.feature_requirements(out),
+            Self::SimplicityFunction(function) => function.feature_requirements(out),
+            Self::Use(use_decl) => use_decl.feature_requirements(out),
+            Self::EnumDeclaration(decl) => decl.feature_requirements(out),
+            Self::Module(module) => module.feature_requirements(out),
+            Self::Ignored => {}
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -228,14 +286,20 @@ pub enum UseItems {
     List(Vec<AliasedSymbolName>),
 }
 
+/// A SimplicityHL function definition.
 #[derive(Clone, Debug)]
 pub struct Function {
     visibility: Visibility,
+    signature: FunctionSignature,
+    body: Expression,
+    span: Span,
+}
+
+#[derive(Clone, Debug)]
+struct FunctionSignature {
     name: FunctionName,
     params: Arc<[FunctionParam]>,
     ret: Option<AliasedType>,
-    body: Expression,
-    span: Span,
 }
 
 impl Function {
@@ -245,19 +309,19 @@ impl Function {
 
     /// Access the name of the function.
     pub fn name(&self) -> &FunctionName {
-        &self.name
+        &self.signature.name
     }
 
     /// Access the parameters of the function.
     pub fn params(&self) -> &[FunctionParam] {
-        &self.params
+        &self.signature.params
     }
 
     /// Access the return type of the function.
     ///
     /// An empty return type means that the function returns the unit value.
     pub fn ret(&self) -> Option<&AliasedType> {
-        self.ret.as_ref()
+        self.signature.ret.as_ref()
     }
 
     /// Access the body of the function.
@@ -273,7 +337,82 @@ impl Function {
 
 impl_eq_hash!(Function; visibility, name, params, ret, body);
 
-impl_require_feature!(Function { recurse: params, ret, body; });
+impl RequireFeature for Function {
+    fn feature_requirements(&self, out: &mut Vec<FeatureRequirement>) {
+        self.signature.params.feature_requirements(out);
+        self.signature.ret.feature_requirements(out);
+        self.body.feature_requirements(out);
+    }
+}
+
+/// An `extern fn` implemented by `export` in a raw Simplicity file.
+#[derive(Clone, Debug)]
+pub struct SimplicityFunction {
+    visibility: Visibility,
+    signature: FunctionSignature,
+    path: Arc<str>,
+    code: Option<RawCode>,
+    span: Span,
+}
+
+impl SimplicityFunction {
+    pub fn visibility(&self) -> &Visibility {
+        &self.visibility
+    }
+
+    /// Access the declared SimplicityHL function name.
+    pub fn name(&self) -> &FunctionName {
+        &self.signature.name
+    }
+
+    /// Access the declared parameters.
+    pub fn params(&self) -> &[FunctionParam] {
+        &self.signature.params
+    }
+
+    /// Access the declared return type, where an omitted type means unit.
+    pub fn ret(&self) -> Option<&AliasedType> {
+        self.signature.ret.as_ref()
+    }
+
+    /// Access the path to the raw Simplicity source file.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Replace the path to the raw Simplicity source file.
+    pub(crate) fn set_path(&mut self, path: Arc<str>) {
+        self.path = path;
+    }
+
+    /// Access the raw code; `None` before the load pass.
+    pub(crate) fn code(&self) -> Option<&RawCode> {
+        self.code.as_ref()
+    }
+
+    /// Give the raw code.
+    pub(crate) fn set_code(&mut self, code: RawCode) {
+        self.code = Some(code);
+    }
+
+    /// Access the span of the complete external declaration.
+    pub fn span(&self) -> &Span {
+        &self.span
+    }
+}
+
+impl_eq_hash!(SimplicityFunction; visibility, name, params, ret, path);
+
+impl RequireFeature for SimplicityFunction {
+    fn feature_requirements(&self, out: &mut Vec<FeatureRequirement>) {
+        self.signature.params.feature_requirements(out);
+        self.signature.ret.feature_requirements(out);
+        out.push(FeatureRequirement::new(
+            UnstableFeature::Simplicity,
+            self.span,
+        ));
+    }
+}
 
 /// Parameter of a function.
 #[derive(Clone, Debug)]
@@ -1143,6 +1282,12 @@ impl AsRef<Span> for Program {
 }
 
 impl AsRef<Span> for Function {
+    fn as_ref(&self) -> &Span {
+        &self.span
+    }
+}
+
+impl AsRef<Span> for SimplicityFunction {
     fn as_ref(&self) -> &Span {
         &self.span
     }

@@ -33,12 +33,13 @@ mod resolve_order;
 mod version_tests;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::{Diagnostic, DiagnosticManager, Error, Span};
 use crate::parse::{self, ParseFromStrWithErrors};
-use crate::resolution::{DependencyMap, ResolvedUse};
+use crate::raw_simplicity::{RawFile, RawFiles, RawSources};
+use crate::resolution::{DependencyMap, ResolvedRaw, ResolvedUse};
 use crate::source::{CanonPath, CanonSourceFile};
 use crate::unstable::UnstableFeatures;
 
@@ -173,6 +174,17 @@ pub(crate) struct DependencyGraph {
     /// Example: If `main.simf` (ID: 0) has `use lib::math;` (ID: 1) and `use lib::io;` (ID: 2),
     /// this map will contain: `{ 0: [1, 2] }`.
     dependencies: HashMap<usize, Vec<usize>>,
+
+    /// Memoizes [`crate::resolution::DependencyMap::resolve_raw_path`] results, keyed by the
+    /// source [`Span`] of each `extern fn` declaration, so the assembly phase can rewrite
+    /// each declared path to the key of its file.
+    raw_cache: HashMap<Span, ResolvedRaw>,
+
+    /// The raw Simplicity files that `extern fn` declarations name, by key.
+    ///
+    /// They are registered in `sources` like modules, but they are not modules: they are
+    /// not parsed here (that needs the jet set) and they are not part of the import graph.
+    raw_files: RawFiles,
 }
 
 impl DependencyGraph {
@@ -187,20 +199,24 @@ impl DependencyGraph {
     /// * `root_source` - The entry-point source file of the project.
     /// * `dependency_map` - The context-aware mapping rules used to resolve external imports.
     /// * `unstable_features` - Feature gates active for this compilation
+    /// * `raw_sources` - Texts of raw Simplicity files that replace the files on disk.
+    ///   `None` leaves the raw files unread (flattening only needs their paths).
     ///
     /// # Returns
     ///
-    /// * `(Some(graph), diagnostics)` if the graph was built without errors.
-    ///   Warnings may be present in `diagnostics`; sources are on the graph.
+    /// * `(Some((program, raw_files)), diagnostics)` if the program was built without
+    ///   errors. Warnings may be present in `diagnostics`; sources are on the diagnostics
+    ///   manager, the raw files included.
     /// * `(None, diagnostics)` if any error was reported. Sources are on
     ///   the diagnostics manager, ready for rendering.
     pub fn build_program(
         root_source: CanonSourceFile,
         dependency_map: Arc<DependencyMap>,
         unstable_features: &UnstableFeatures,
-    ) -> (Option<parse::Program>, DiagnosticManager) {
+        raw_sources: Option<&RawSources>,
+    ) -> (Option<(parse::Program, RawFiles)>, DiagnosticManager) {
         let (graph, mut diagnostics) =
-            Self::build_graph(root_source, dependency_map, unstable_features);
+            Self::build_graph(root_source, dependency_map, unstable_features, raw_sources);
 
         let Some(graph) = graph else {
             return (None, diagnostics);
@@ -208,7 +224,10 @@ impl DependencyGraph {
 
         let program = graph.linearize_and_assemble(&mut diagnostics);
         diagnostics.with_sources(graph.sources);
-        (program, diagnostics)
+        (
+            program.map(|program| (program, graph.raw_files)),
+            diagnostics,
+        )
     }
 
     /// Build the dependency graph without linearizing. Exposed for tests
@@ -217,6 +236,7 @@ impl DependencyGraph {
         root_source: CanonSourceFile,
         dependency_map: Arc<DependencyMap>,
         unstable_features: &UnstableFeatures,
+        raw_sources: Option<&RawSources>,
     ) -> (Option<Self>, DiagnosticManager) {
         let mut diagnostics = DiagnosticManager::default();
         let sources = SourceMap::with_source(root_source.clone());
@@ -247,9 +267,11 @@ impl DependencyGraph {
             sources,
             use_cache: HashMap::new(),
             dependencies: HashMap::new(),
+            raw_cache: HashMap::new(),
+            raw_files: RawFiles::new(),
         };
 
-        graph.discover_dependencies(&mut diagnostics, unstable_features);
+        graph.discover_dependencies(&mut diagnostics, unstable_features, raw_sources);
 
         if diagnostics.has_errors() {
             if let Ok(order) = graph.linearize() {
@@ -269,11 +291,25 @@ impl DependencyGraph {
         &mut self,
         diagnostics: &mut DiagnosticManager,
         unstable_features: &UnstableFeatures,
+        raw_sources: Option<&RawSources>,
     ) {
         self.dependencies.insert(MAIN_MODULE, Vec::new());
         let mut use_cache = HashMap::new();
+        let mut raw_cache = HashMap::new();
         let mut queue = VecDeque::new();
         queue.push_back(MAIN_MODULE);
+
+        // Raw files are keyed by their path relative to the project root: the package root
+        // of the entry file, or its directory if no package owns it.
+        let entry_file = self.modules[&MAIN_MODULE].source.name();
+        let project_root = match self.dependency_map.get_package_root(entry_file) {
+            Some(root) => root.clone(),
+            None => entry_file
+                .as_path()
+                .parent()
+                .and_then(|dir| CanonPath::canonicalize(dir).ok())
+                .unwrap_or_else(|| entry_file.clone()),
+        };
 
         // Prevent errors in the checked files from being doubled in the `load_and_parse_dependencies` function.
         let mut invalid_imports = HashSet::new();
@@ -297,13 +333,19 @@ impl DependencyGraph {
                 source: importer_source,
             };
 
-            let valid_imports = Self::resolve_imports(
-                &current_source_module.program,
-                &current,
-                &self.dependency_map,
-                &mut use_cache,
+            let mut ctx = ImportContext {
+                current: current.clone(),
+                dependency_map: &self.dependency_map,
+                project_root: &project_root,
+                use_cache: &mut use_cache,
+                raw_cache: &mut raw_cache,
                 diagnostics,
-            );
+            };
+            let (valid_imports, raw_imports) = ctx.resolve_imports(&current_source_module.program);
+
+            if let Some(raw_sources) = raw_sources {
+                self.load_raw_files(raw_imports, raw_sources, diagnostics);
+            }
 
             let mut ctx = LoadContext {
                 invalid_imports: &mut invalid_imports,
@@ -315,33 +357,51 @@ impl DependencyGraph {
         }
 
         self.use_cache = use_cache;
+        self.raw_cache = raw_cache;
     }
 
-    /// PHASE 1 OF GRAPH CONSTRUCTION: Resolves all `use` declarations within a single
-    /// [`parse::Program`], recursively walking into inline `mod` blocks.
+    /// Reads the raw Simplicity files that `extern fn` declarations resolved to and
+    /// registers them in the source map, like [`Self::load_and_parse_dependencies`] does
+    /// for modules.
     ///
-    /// Results are cached in `use_cache` to avoid redundant filesystem lookups during
-    /// later construction phases.
-    /// Note: This is a specialized helper designed exclusively for `DependencyGraph::build_graph`.
-    fn resolve_imports(
-        current_program: &parse::Program,
-        current_module: &CurrentModule,
-        dependency_map: &DependencyMap,
-        use_cache: &mut HashMap<Span, ResolvedUse>,
+    /// The text given for a key in `raw_sources` replaces the file on disk. A file is only
+    /// read: parsing it needs the jet set, so it happens later
+    /// ([`crate::raw_simplicity::load_raw_code`]).
+    fn load_raw_files(
+        &mut self,
+        raw_imports: Vec<(ResolvedRaw, Span)>,
+        raw_sources: &RawSources,
         diagnostics: &mut DiagnosticManager,
-    ) -> Vec<(CanonPath, Span)> {
-        let mut ctx = ImportContext {
-            current: current_module.clone(),
-            dependency_map,
-            use_cache,
-            diagnostics,
-        };
+    ) {
+        for (ResolvedRaw { path, key }, span) in raw_imports {
+            if self.raw_files.contains_key(&key) {
+                continue;
+            }
 
-        let mut valid_imports = Vec::new();
-        for item in current_program.items() {
-            ctx.process_item(item, &mut valid_imports);
+            let raw = match raw_sources.get(&key) {
+                Some(text) => RawFile {
+                    origin: Arc::from(Path::new(key.as_ref())),
+                    text: Arc::clone(text),
+                },
+                None => match std::fs::read_to_string(path.as_path()) {
+                    Ok(text) => RawFile {
+                        origin: Arc::from(path.as_path()),
+                        text: Arc::from(text),
+                    },
+                    Err(e) => {
+                        let msg = format!("cannot read {}: {e}", path.as_path().display());
+                        diagnostics.push(Diagnostic::new(Error::Simplicity { msg }, span));
+                        continue;
+                    }
+                },
+            };
+
+            if self.sources.id(&path).is_none() {
+                self.sources
+                    .insert(CanonSourceFile::new(path, Arc::clone(&raw.text)));
+            }
+            self.raw_files.insert(key, raw);
         }
-        valid_imports
     }
 
     /// PHASE 2 OF GRAPH CONSTRUCTION: Loads, parses, and registers new dependencies.
@@ -439,24 +499,53 @@ impl DependencyGraph {
     }
 }
 
+/// The files that the `use` and `extern fn` declarations of one module resolved to,
+/// each with the span of its declaration.
+type ResolvedImports = (Vec<(CanonPath, Span)>, Vec<(ResolvedRaw, Span)>);
+
 /// Groups all shared state for import resolution to avoid threading a lot of parameters
 /// through every recursive call. Lives only for the duration of [`DependencyGraph::resolve_imports`].
 struct ImportContext<'a> {
     current: CurrentModule,
     dependency_map: &'a DependencyMap,
+    /// The package root of the entry file, which raw file keys are relative to.
+    project_root: &'a CanonPath,
     use_cache: &'a mut HashMap<Span, ResolvedUse>,
+    raw_cache: &'a mut HashMap<Span, ResolvedRaw>,
     diagnostics: &'a mut DiagnosticManager,
 }
 
 impl<'a> ImportContext<'a> {
-    /// Recursively walks an item, collecting resolved imports.
+    /// PHASE 1 OF GRAPH CONSTRUCTION: Resolves all `use` and `extern fn` declarations
+    /// within a single [`parse::Program`], recursively walking into inline `mod` blocks.
+    ///
+    /// Results are cached in `use_cache` and `raw_cache` to avoid redundant filesystem
+    /// lookups during later construction phases.
+    fn resolve_imports(&mut self, program: &parse::Program) -> ResolvedImports {
+        let mut valid_imports = Vec::new();
+        let mut raw_imports = Vec::new();
+        for item in program.items() {
+            self.process_item(item, &mut valid_imports, &mut raw_imports);
+        }
+        (valid_imports, raw_imports)
+    }
+
+    /// Recursively walks an item, collecting resolved imports and resolved raw files.
     /// Recurses into inline `mod` blocks.
-    fn process_item(&mut self, item: &parse::Item, valid_imports: &mut Vec<(CanonPath, Span)>) {
+    fn process_item(
+        &mut self,
+        item: &parse::Item,
+        valid_imports: &mut Vec<(CanonPath, Span)>,
+        raw_imports: &mut Vec<(ResolvedRaw, Span)>,
+    ) {
         match item {
             parse::Item::Use(use_decl) => valid_imports.extend(self.resolve_single(use_decl)),
+            parse::Item::SimplicityFunction(function) => {
+                raw_imports.extend(self.resolve_raw(function));
+            }
             parse::Item::Module(module) => {
                 for item in module.items() {
-                    self.process_item(item, valid_imports);
+                    self.process_item(item, valid_imports, raw_imports);
                 }
             }
 
@@ -465,6 +554,30 @@ impl<'a> ImportContext<'a> {
             | parse::Item::Function(_)
             | parse::Item::EnumDeclaration(_)
             | parse::Item::Ignored => {}
+        }
+    }
+
+    /// Resolves the raw file of a single `extern fn` declaration, caches the result for
+    /// the assembly phase, and returns it with the declaration span.
+    /// Returns `None` and reports to `diagnostics` if resolution fails.
+    fn resolve_raw(&mut self, function: &parse::SimplicityFunction) -> Option<(ResolvedRaw, Span)> {
+        let span = *function.span();
+
+        let resolved = self.dependency_map.resolve_raw_path(
+            self.current.source.name(),
+            self.project_root,
+            function.path(),
+        );
+
+        match resolved {
+            Ok(resolved) => {
+                self.raw_cache.insert(span, resolved.clone());
+                Some((resolved, span))
+            }
+            Err(error) => {
+                self.diagnostics.push(Diagnostic::new(error, span));
+                None
+            }
         }
     }
 
@@ -575,8 +688,12 @@ pub(crate) mod tests {
         }
         let root_source = root_source_opt.expect("main.simf must be defined in file list");
 
-        let (graph_opt, diagnostics) =
-            DependencyGraph::build_graph(root_source, dependency_map, &UnstableFeatures::all());
+        let (graph_opt, diagnostics) = DependencyGraph::build_graph(
+            root_source,
+            dependency_map,
+            &UnstableFeatures::all(),
+            Some(&RawSources::new()),
+        );
 
         let file_ids = match &graph_opt {
             Some(graph) => build_file_ids(&graph.sources),
@@ -782,6 +899,7 @@ pub(crate) mod tests {
             CanonSourceFile::new(main, Arc::from(content)),
             dependency_map,
             &UnstableFeatures::all(),
+            Some(&RawSources::new()),
         );
 
         assert!(graph.is_none());
@@ -789,6 +907,187 @@ pub(crate) mod tests {
             .diagnostics()
             .iter()
             .any(|d| matches!(d.error(), Error::FileNotFound { .. })));
+    }
+
+    const RAW: &str = "export := iden : 2^32 -> 2^32";
+
+    #[test]
+    fn raw_files_are_registered_as_sources_but_not_as_modules() {
+        let (graph, ids, _ws, _diags) = setup_graph(vec![
+            (
+                "main.simf",
+                "#[path = \"raw/id.simpl\"] extern fn id(a: u32) -> u32;\nfn main() {}",
+            ),
+            ("raw/id.simpl", RAW),
+        ]);
+
+        let raw_id = ids["id"];
+        assert_eq!(graph.sources.content(raw_id).as_deref(), Some(RAW));
+        assert!(
+            !graph.modules.contains_key(&raw_id),
+            "a raw file is not a module"
+        );
+        assert!(
+            graph
+                .dependencies
+                .values()
+                .all(|deps| !deps.contains(&raw_id)),
+            "a raw file is not part of the import graph"
+        );
+
+        let [(key, raw)] = graph.raw_files.iter().collect::<Vec<_>>()[..] else {
+            panic!("expected one loaded raw file");
+        };
+        assert_eq!(key.as_ref(), "raw/id.simpl");
+        assert_eq!(raw.text.as_ref(), RAW);
+    }
+
+    #[test]
+    fn raw_file_named_by_two_modules_is_loaded_once() {
+        let (graph, _ids, _ws, _diags) = setup_graph(vec![
+            (
+                "main.simf",
+                "use crate::nested::A::a;\n\
+                 #[path = \"id.simpl\"] extern fn b(x: u32) -> u32;\n\
+                 fn main() {}",
+            ),
+            (
+                "nested/A.simf",
+                "#[path = \"../id.simpl\"] pub extern fn a(x: u32) -> u32;",
+            ),
+            ("id.simpl", RAW),
+        ]);
+
+        let simpl_entries = graph
+            .sources
+            .iter()
+            .filter(|(path, _)| path.as_path().extension().is_some_and(|ext| ext == "simpl"))
+            .count();
+        assert_eq!(simpl_entries, 1, "one source entry for both declarations");
+
+        assert_eq!(graph.raw_cache.len(), 2, "both declarations are resolved");
+        let keys: HashSet<_> = graph.raw_cache.values().map(|raw| &raw.key).collect();
+        assert_eq!(keys.len(), 1, "both declarations name the same file");
+        assert_eq!(graph.raw_files.len(), 1, "the file is read once");
+    }
+
+    #[test]
+    fn raw_path_outside_the_declaring_package_is_rejected() {
+        // `libs/lib` is a package of its own, so its declarations cannot reach the workspace.
+        let (graph, _ids, _ws, diagnostics) = setup_graph_raw(vec![
+            ("main.simf", "use lib::A::a;\nfn main() {}"),
+            (
+                "libs/lib/A.simf",
+                "#[path = \"../../id.simpl\"] pub extern fn a(x: u32) -> u32;",
+            ),
+            ("id.simpl", RAW),
+        ]);
+
+        assert!(graph.is_none(), "the program is not built");
+        let rendered = diagnostics.to_string();
+        assert!(rendered.contains("leaves the package"), "{rendered}");
+    }
+
+    #[test]
+    fn raw_keys_are_relative_to_the_project_root() {
+        // The entry file is in a subdirectory of the project; the key does not start with `..`.
+        let ws = TempWorkspace::new("raw_project_keys");
+        let workspace_dir = canon(&ws.create_dir("workspace"));
+        ws.create_file("workspace/raw/id.simpl", RAW);
+
+        let content = "#[path = \"../raw/id.simpl\"] extern fn id(a: u32) -> u32;\nfn main() {}";
+        let main = canon(&ws.create_file("workspace/contracts/main.simf", content));
+        let dependency_map = Arc::new(build_map(&workspace_dir, &[]).unwrap());
+
+        let (graph, diagnostics) = DependencyGraph::build_graph(
+            CanonSourceFile::new(main, Arc::from(content)),
+            dependency_map,
+            &UnstableFeatures::all(),
+            Some(&RawSources::new()),
+        );
+        let graph = graph.unwrap_or_else(|| panic!("{diagnostics}"));
+
+        let [resolved] = graph.raw_cache.values().collect::<Vec<_>>()[..] else {
+            panic!("expected one resolved raw file");
+        };
+        assert_eq!(resolved.key.as_ref(), "raw/id.simpl");
+        assert!(graph.raw_files.contains_key("raw/id.simpl"));
+    }
+
+    #[test]
+    fn raw_file_of_a_package_outside_the_project_is_rejected() {
+        let ws = TempWorkspace::new("raw_outside_project");
+        let workspace_dir = canon(&ws.create_dir("workspace"));
+        let lib_dir = canon(&ws.create_dir("external/lib"));
+        ws.create_file(
+            "external/lib/A.simf",
+            "#[path = \"id.simpl\"] pub extern fn a(x: u32) -> u32;",
+        );
+        ws.create_file("external/lib/id.simpl", RAW);
+
+        let content = "use lib::A::a;\nfn main() {}";
+        let main = canon(&ws.create_file("workspace/main.simf", content));
+        let dependency_map =
+            Arc::new(build_map(&workspace_dir, &[(&workspace_dir, "lib", &lib_dir)]).unwrap());
+
+        let (graph, diagnostics) = DependencyGraph::build_graph(
+            CanonSourceFile::new(main, Arc::from(content)),
+            dependency_map,
+            &UnstableFeatures::all(),
+            Some(&RawSources::new()),
+        );
+
+        assert!(graph.is_none(), "the program is not built");
+        let rendered = diagnostics.to_string();
+        assert!(rendered.contains("outside the project"), "{rendered}");
+    }
+
+    #[test]
+    fn given_raw_text_replaces_the_file_on_disk() {
+        let ws = TempWorkspace::new("raw_given_text");
+        let workspace_dir = canon(&ws.create_dir("workspace"));
+        ws.create_file("workspace/id.simpl", "export := unit : 1 -> 1");
+
+        let content = "#[path = \"id.simpl\"] extern fn id(a: u32) -> u32;\nfn main() {}";
+        let main = canon(&ws.create_file("workspace/main.simf", content));
+        let dependency_map = Arc::new(build_map(&workspace_dir, &[]).unwrap());
+
+        let mut given = RawSources::new();
+        given.insert(Arc::from("id.simpl"), Arc::from(RAW));
+
+        let (graph, diagnostics) = DependencyGraph::build_graph(
+            CanonSourceFile::new(main, Arc::from(content)),
+            dependency_map,
+            &UnstableFeatures::all(),
+            Some(&given),
+        );
+        let graph = graph.unwrap_or_else(|| panic!("{diagnostics}"));
+
+        let raw_id = graph
+            .sources
+            .id(&canon(&workspace_dir.as_path().join("id.simpl")))
+            .expect("the file on disk is registered");
+        assert_eq!(graph.sources.content(raw_id).as_deref(), Some(RAW));
+    }
+
+    #[test]
+    fn missing_raw_file_is_reported_at_the_declaration() {
+        let decl = "#[path = \"absent.simpl\"] extern fn f(a: u32) -> bool;";
+        let (graph, _ids, _ws, diagnostics) =
+            setup_graph_raw(vec![("main.simf", &format!("{decl}\nfn main() {{}}"))]);
+
+        assert!(graph.is_none(), "the program is not built");
+        let [diagnostic] = diagnostics.diagnostics() else {
+            panic!("expected one diagnostic: {diagnostics}");
+        };
+        assert!(
+            diagnostic.to_string().contains("cannot read"),
+            "{diagnostic}"
+        );
+        let crate::error::Location::Code(span) = diagnostic.location() else {
+            panic!("expected the declaration span");
+        };
+        assert_eq!((span.start, span.end), (0, decl.len()));
     }
 
     #[test]

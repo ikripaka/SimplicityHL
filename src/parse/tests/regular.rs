@@ -265,6 +265,33 @@ fn statement_spans_exclude_terminating_semicolons() {
     assert_eq!(statements[1].span().to_slice(input), Some("value"));
 }
 
+#[test]
+fn simplicity_function_has_its_own_declaration_syntax() {
+    const EXTERN_FN: &str = "#[path = \"raw/id.simpl\"]\n\
+                       pub extern fn raw_id(value: u32) -> u32;";
+
+    let source = format!("{EXTERN_FN}\nfn main() {{}}");
+    let program = Program::parse_from_str(&source).expect("program parses");
+
+    let [Item::SimplicityFunction(external), Item::Function(_)] = program.items() else {
+        panic!("expected external and SimplicityHL functions");
+    };
+    assert_eq!(external.visibility(), &Visibility::Public);
+    assert_eq!(external.path(), "raw/id.simpl");
+    assert_eq!(external.span().to_slice(&source), Some(EXTERN_FN));
+    assert_eq!(external.to_string(), EXTERN_FN);
+    assert_eq!(
+        parse::SimplicityFunction::parse_from_str(EXTERN_FN).unwrap(),
+        *external
+    );
+
+    assert!(parse::Function::parse_from_str(EXTERN_FN).is_err());
+    assert!(parse::SimplicityFunction::parse_from_str("extern fn raw_id();").is_err());
+    assert!(parse::SimplicityFunction::parse_from_str(EXTERN_FN.trim_end_matches(';')).is_err());
+    let old_attribute = r#"#[simplicity(path = "raw/id.simpl", entry = "id")] extern fn raw_id();"#;
+    assert!(parse::SimplicityFunction::parse_from_str(old_attribute).is_err());
+}
+
 fn parse_item(input: &str) -> Item {
     let program = parse::Program::parse_from_str(input).expect("parsing should succeed");
     program.items().first().expect("expected one item").clone()
