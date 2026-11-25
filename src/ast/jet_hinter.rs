@@ -1,6 +1,10 @@
+use std::sync::Arc;
+
 use simplicity::jet::{Core, Elements, Jet};
 
 use crate::jet::JetHL;
+use crate::parse::{parse_export, SimplicityParser};
+use crate::CommitNode;
 
 /// Object which produces a specific kind of jet.
 ///
@@ -10,7 +14,7 @@ use crate::jet::JetHL;
 ///
 /// Users may rely on this property for correctness of their code, though since this
 /// is a safe trait, of course they may not rely on it for soundness.
-pub trait JetHinter: std::fmt::Debug + Send + Sync {
+pub trait JetHinter: std::fmt::Debug + Send + Sync + SimplicityParser {
     /// Attempts to parse a jet from a string.
     fn parse_jet(&self, name: &str) -> Option<Box<dyn JetHL>>;
     /// Constructs an instance of the `verify` jet.
@@ -127,6 +131,12 @@ macro_rules! impl_jet_hinter {
             }
             fn construct_sha_256_ctx_8_finalize(&self) -> Option<Box<dyn JetHL>> {
                 Some(Box::new($jet_type::Sha256Ctx8Finalize))
+            }
+        }
+
+        impl SimplicityParser for $struct_name {
+            fn parse_simplicity(&self, source: &str) -> Result<Arc<CommitNode>, String> {
+                parse_export::<$jet_type>(source)
             }
         }
     };

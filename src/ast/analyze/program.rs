@@ -87,10 +87,11 @@ impl Program {
 impl Item {
     /// Analyze the items of a module in order.
     fn analyze_items(from: &[parse::Item], scope: &mut Scope) -> Result<Vec<Self>, Failure> {
+        let unit = ResolvedType::unit();
         let mut items = Vec::with_capacity(from.len());
 
         for item in from {
-            match Self::analyze(item, scope) {
+            match Self::analyze(item, &unit, scope) {
                 Ok(item) => items.push(item),
                 Err(failure) if matches!(item, parse::Item::Function(f) if f.name() == MAIN_STR) => {
                     scope.report(failure);
@@ -101,8 +102,13 @@ impl Item {
 
         Ok(items)
     }
+}
 
-    fn analyze(from: &parse::Item, scope: &mut Scope) -> Result<Self, Failure> {
+impl AbstractSyntaxTree for Item {
+    type From = parse::Item;
+
+    fn analyze(from: &Self::From, ty: &ResolvedType, scope: &mut Scope) -> Result<Self, Failure> {
+        assert!(ty.is_unit(), "Items cannot return anything");
         assert!(
             scope.is_outside_function(),
             "Variables live only inside the function"
@@ -111,14 +117,13 @@ impl Item {
         match from {
             parse::Item::TypeAlias(alias) => {
                 scope.insert_alias(alias.clone()).with_span(alias)?;
-
                 Ok(Self::TypeAlias)
             }
             parse::Item::Function(function) => {
-                Function::analyze(function, &ResolvedType::unit(), scope).map(Self::Function)
+                Function::analyze(function, ty, scope).map(Self::Function)
             }
             parse::Item::SimplicityFunction(function) => {
-                ExternFunction::analyze(function, &ResolvedType::unit(), scope)?;
+                ExternFunction::analyze(function, ty, scope)?;
 
                 Ok(Self::ExternFunction)
             }
@@ -174,7 +179,7 @@ impl Item {
                 .in_module(
                     module.name().clone(),
                     module.visibility().clone(),
-                    |scope| Self::analyze_items(module.items(), scope).map(Self::Module),
+                    |scope| Item::analyze_items(module.items(), scope).map(Self::Module),
                 )
                 .with_span(module)?,
             parse::Item::Ignored => Ok(Self::Ignored),

@@ -36,7 +36,7 @@ pub use self::grammar::ChumskyParse;
 #[cfg(feature = "fmt")]
 pub use self::lossless::ParsedSource;
 pub use self::pipeline::{ParseFromStr, ParseFromStrWithErrors};
-pub use self::simplicity::{parse_simplicity, SimplicityParser};
+pub use self::simplicity::{parse_export, parse_simplicity, SimplicityParser};
 
 /// A program is a sequence of items.
 #[derive(Clone, Debug)]

@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
 use simplicity::human_encoding::Forest;
-use simplicity::jet::{Bitcoin, Core, Elements, Jet};
+use simplicity::jet::Jet;
 use simplicity::CommitNode;
 
 use crate::ast::JetHinter;
 use crate::raw_simplicity::EXPORT_ROOT;
 
-/// Parses the [`EXPORT_ROOT`] root of a raw Simplicity file with the jet set of `self`.
+/// Parses the [`EXPORT_ROOT`](crate::raw_simplicity::EXPORT_ROOT) root of a raw Simplicity file with the jet set of `self`.
 ///
-/// Every [`JetHL`](crate::jet::JetHL) implements this trait. By default, a jet set has no
+/// Every [`JetHinter`](crate::ast::JetHinter) implements this trait. By default, a jet set has no
 /// raw parser; the jet sets of this crate redefine it to parse with their own jets.
 pub trait SimplicityParser {
     fn parse_simplicity(&self, _source: &str) -> Result<Arc<CommitNode>, String> {
@@ -22,10 +22,10 @@ pub fn parse_simplicity(
     source: &str,
     jet_hinter: &dyn JetHinter,
 ) -> Result<Arc<CommitNode>, String> {
-    jet_hinter.construct_verify().parse_simplicity(source)
+    jet_hinter.parse_simplicity(source)
 }
 
-fn parse_export<J: Jet>(source: &str) -> Result<Arc<CommitNode>, String> {
+pub fn parse_export<J: Jet>(source: &str) -> Result<Arc<CommitNode>, String> {
     let forest = Forest::parse::<J>(source).map_err(|errors| errors.to_string())?;
     let root = forest
         .roots()
@@ -33,17 +33,3 @@ fn parse_export<J: Jet>(source: &str) -> Result<Arc<CommitNode>, String> {
         .ok_or_else(|| format!("no root entry `{EXPORT_ROOT}`"))?;
     Ok(root.to_commit_node())
 }
-
-macro_rules! impl_simpl_parser {
-    ($jet:ty) => {
-        impl SimplicityParser for $jet {
-            fn parse_simplicity(&self, source: &str) -> Result<Arc<CommitNode>, String> {
-                parse_export::<$jet>(source)
-            }
-        }
-    };
-}
-
-impl_simpl_parser!(Elements);
-impl_simpl_parser!(Core);
-impl_simpl_parser!(Bitcoin);

@@ -421,9 +421,13 @@ impl CompiledProgram {
         include_debug_symbols: bool,
         jet_hinter: Box<dyn ast::JetHinter>,
     ) -> Result<Self, String> {
-        TemplateAst::new(s, jet_hinter)
-            .map_err(|error| error.to_string())
-            .and_then(|template| template.instantiate(arguments, include_debug_symbols))
+        Self::new_with_unstable(
+            s,
+            &UnstableFeatures::none(),
+            arguments,
+            include_debug_symbols,
+            jet_hinter,
+        )
     }
 
     /// Like [`new`](Self::new), but rejects any unstable feature used by the
@@ -566,8 +570,14 @@ impl SatisfiedProgram {
         include_debug_symbols: bool,
         jet_hinter: Box<dyn ast::JetHinter>,
     ) -> Result<Self, String> {
-        CompiledProgram::new(s, arguments, include_debug_symbols, jet_hinter)?
-            .satisfy(witness_values)
+        Self::new_with_unstable(
+            s,
+            &UnstableFeatures::none(),
+            arguments,
+            witness_values,
+            include_debug_symbols,
+            jet_hinter,
+        )
     }
 
     /// Like [`new`](Self::new), but rejects any unstable feature used by the
@@ -692,7 +702,7 @@ pub trait ArbitraryOfType: Sized {
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::ast::{CoreJetHinter, ElementsJetHinter, JetHinter};
-    use crate::parse::ParseFromStr;
+    use crate::parse::{ParseFromStr, SimplicityParser};
     use crate::resolution::tests::{build_map, canon};
     use crate::resolution::DependencyMapBuilder;
     use crate::source::CanonPath;
@@ -1672,6 +1682,8 @@ fn main() {
 
         #[derive(Debug, Clone)]
         struct NoShaJetHinter(CoreJetHinter);
+
+        impl SimplicityParser for NoShaJetHinter {}
 
         impl JetHinter for NoShaJetHinter {
             fn parse_jet(&self, name: &str) -> Option<Box<dyn JetHL>> {
