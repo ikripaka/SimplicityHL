@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::driver::{DependencyGraph, CRATE_STR, MAIN_MODULE, MAIN_STR};
 use crate::error::{Diagnostic, DiagnosticManager, Error, Span};
@@ -159,9 +160,9 @@ impl DependencyGraph {
                     &items,
                 )))
             }
+            parse::Item::SimplicityFunction(function) => Some(self.rewrite_raw(function)),
             parse::Item::TypeAlias(_)
             | parse::Item::Function(_)
-            | parse::Item::SimplicityFunction(_)
             | parse::Item::EnumDeclaration(_) => Some(item.clone()),
             parse::Item::Ignored => None,
         }
@@ -192,6 +193,20 @@ impl DependencyGraph {
         let mut use_decl = use_decl.clone();
         use_decl.set_path(&new_path);
         parse::Item::Use(use_decl)
+    }
+
+    /// Rewrites the path of an `extern fn` declaration to the key of its raw file:
+    /// relative to the project root, so the flattened program names every file the same way.
+    ///
+    /// ## Example
+    ///
+    /// - `#[path = "../raw/eq.simpl"]` in `lib/a.simf` → `#[path = "raw/eq.simpl"]`
+    fn rewrite_raw(&self, function: &parse::SimplicityFunction) -> parse::Item {
+        let mut function = function.clone();
+        if let Some(resolved) = self.raw_cache.get(function.span()) {
+            function.set_path(Arc::clone(&resolved.key));
+        }
+        parse::Item::SimplicityFunction(function)
     }
 
     fn get_module_name(source_id: usize) -> Identifier {

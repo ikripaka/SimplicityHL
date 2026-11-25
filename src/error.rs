@@ -24,7 +24,7 @@ use crate::parse::MatchPattern;
 use crate::str::{AliasName, FunctionName, Identifier, JetName, ModuleName};
 use crate::types::{ResolvedType, StructuralType, UIntType};
 use crate::unstable::UnstableFeature;
-use crate::{RawOrigin, TemplateProgramWitness};
+use crate::TemplateProgramWitness;
 
 /// Area that an object spans inside a file.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -834,7 +834,7 @@ pub enum Error {
         msg: String,
     },
     SimplicityTypeMismatch {
-        origin: RawOrigin,
+        origin: Arc<std::path::Path>,
         entry: String,
         expected_input: Box<ResolvedType>,
         expected_output: Box<ResolvedType>,
@@ -1064,7 +1064,7 @@ impl fmt::Display for Error {
                     (false, true) => "output",
                     (false, false) => "signature",
                 };
-                write!(f, "Raw Simplicity: {origin} entry `{entry}` has a mismatched {mismatch}; declared HL {expected_input} → {expected_output}, expected structural {input} → {output}, found {found_input} → {found_output}. Consider annotating the raw entry's type.")
+                write!(f, "Raw Simplicity: {} entry `{entry}` has a mismatched {mismatch}; declared HL {expected_input} → {expected_output}, expected structural {input} → {output}, found {found_input} → {found_output}. Consider annotating the raw entry's type.", origin.display())
             },
             Error::CannotParse{ msg } => write!(
                 f,

@@ -54,65 +54,6 @@ impl Program {
         }
     }
 
-    /// Rewrites each declared in `extern fn` path to its key ([`crate::RawSources`]), so
-    /// the flattened source keeps naming the same files.
-    pub(crate) fn relativize_raw_paths(
-        &mut self,
-        sources: &crate::driver::SourceMap,
-    ) -> Result<Vec<crate::RawDependency>, Diagnostic> {
-        fn visit(
-            items: &mut [Item],
-            sources: &crate::driver::SourceMap,
-            out: &mut Vec<crate::RawDependency>,
-        ) -> Result<(), Diagnostic> {
-            for item in items {
-                match item {
-                    Item::SimplicityFunction(function) => {
-                        let file_id = function.span.file_id;
-                        let path = function.path();
-
-                        let (key, file) =
-                            crate::raw_simplicity::locate(path, file_id, Some(sources))
-                                .ok_or_else(|| {
-                                Diagnostic::new(
-                                    Error::Simplicity {
-                                        msg: format!(
-                                            "cannot write the external path `{path}` in flattened source"
-                                        ),
-                                    },
-                                    function.span,
-                                )
-                            })?;
-
-                        let file = file.unwrap_or_else(|| PathBuf::from(key.as_ref()));
-                        function.path = key;
-
-                        if !out.iter().any(|dep| dep.path == function.path) {
-                            out.push(crate::RawDependency {
-                                path: Arc::clone(&function.path),
-                                file,
-                            });
-                        }
-                    }
-                    Item::Module(module) => visit(Arc::make_mut(&mut module.items), sources, out)?,
-
-                    Item::TypeAlias(_)
-                    | Item::Function(_)
-                    | Item::Use(_)
-                    | Item::EnumDeclaration(_)
-                    | Item::Ignored => {}
-                }
-            }
-            Ok(())
-        }
-
-        let mut out = Vec::new();
-
-        visit(Arc::make_mut(&mut self.items), sources, &mut out)?;
-
-        Ok(out)
-    }
-
     /// Call `f` on every `extern fn` declaration, in declaration order.
     pub(crate) fn for_each_extern_function_mut(
         &mut self,
@@ -437,6 +378,11 @@ impl SimplicityFunction {
     /// Access the path to the raw Simplicity source file.
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// Replace the path to the raw Simplicity source file.
+    pub(crate) fn set_path(&mut self, path: Arc<str>) {
+        self.path = path;
     }
 
     /// Access the raw code; `None` before the load pass.

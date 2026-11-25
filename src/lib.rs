@@ -47,8 +47,7 @@ use crate::debug::DebugSymbols;
 use crate::driver::{DependencyGraph, SourceMap, MAIN_MODULE};
 use crate::error::DiagnosticManager;
 use crate::parse::ParseFromStrWithErrors;
-use crate::raw_simplicity::LoadedRaw;
-pub use crate::raw_simplicity::{RawDependency, RawImport, RawOrigin, RawSource, RawSources};
+pub use crate::raw_simplicity::RawSources;
 use crate::resolution::DependencyMap;
 use crate::source::CanonSourceFile;
 pub use crate::template_program::{TemplateProgram, TemplateProgramWitness};
@@ -70,12 +69,15 @@ pub struct TemplateAst {
     jet_hinter: Box<dyn ast::JetHinter>,
     diagnostics: DiagnosticManager,
     resolved_program: parse::Program,
-    loaded_raw: LoadedRaw,
+    raw_imports: Vec<Arc<str>>,
 }
 
 impl TemplateAst {
     /// Parses and flattens a multi-file program into a single enriched [`parse::Program`]
     /// with all imports resolved and each file wrapped in a `unit_N` module.
+    ///
+    /// The paths of `extern fn` declarations are rewritten to their keys ([`RawSources`]):
+    /// relative to the project root. The raw files are not read.
     ///
     /// ## Errors
     ///
@@ -85,44 +87,18 @@ impl TemplateAst {
         dependency_map: &DependencyMap,
         unstable_features: &UnstableFeatures,
     ) -> Result<String, DiagnosticManager> {
-        Self::flatten_with_raw_dependencies(source, dependency_map, unstable_features)
-            .map(|(text, _)| text)
-    }
-
-    /// Like [`flatten`](Self::flatten), and also returns the raw Simplicity files that `extern fn`
-    /// declarations refer to. Their paths in the flattened source are relative to the directory
-    /// of the entry file (see [`RawDependency`]).
-    ///
-    /// ## Errors
-    ///
-    /// The string is not a valid SimplicityHL program, or a raw file cannot be found.
-    pub fn flatten_with_raw_dependencies(
-        source: CanonSourceFile,
-        dependency_map: &DependencyMap,
-        unstable_features: &UnstableFeatures,
-    ) -> Result<(String, Vec<RawDependency>), DiagnosticManager> {
-        let (program, mut diagnostics) = DependencyGraph::build_program(
+        let (program, diagnostics) = DependencyGraph::build_program(
             source,
             Arc::from(dependency_map.clone()),
             unstable_features,
+            None,
         );
 
-        let Some(mut resolved_program) = program else {
+        let Some((resolved_program, _)) = program else {
             return Err(diagnostics);
         };
 
-        let mut raw_dependencies = Vec::new();
-        if let Some(sources) = diagnostics.sources() {
-            match resolved_program.relativize_raw_paths(sources) {
-                Ok(deps) => raw_dependencies = deps,
-                Err(error) => {
-                    diagnostics.push(error);
-                    return Err(diagnostics);
-                }
-            }
-        }
-
-        Ok((resolved_program.to_string(), raw_dependencies))
+        Ok(resolved_program.to_string())
     }
 
     /// Parse the template of a SimplicityHL program.
@@ -141,7 +117,7 @@ impl TemplateAst {
             dependency_map,
             unstable_features,
             jet_hinter,
-            &RawSources::from_disk(),
+            &RawSources::new(),
         )
     }
 
@@ -163,15 +139,17 @@ impl TemplateAst {
             source,
             Arc::from(dependency_map.clone()),
             unstable_features,
+            Some(raw_sources),
         );
 
-        let Some(mut resolved_program) = program else {
+        let Some((mut resolved_program, raw_files)) = program else {
             return Err(diagnostics);
         };
 
-        let Some((simfony, loaded_raw)) = Self::analyze_with_raw_sources(
+        let Some((simfony, raw_imports)) = Self::analyze_with_raw_sources(
             &mut resolved_program,
             jet_hinter.as_ref(),
+            &raw_files,
             raw_sources,
             &mut diagnostics,
         ) else {
@@ -184,7 +162,7 @@ impl TemplateAst {
             jet_hinter,
             diagnostics,
             resolved_program,
-            loaded_raw,
+            raw_imports,
         })
     }
 
@@ -207,7 +185,7 @@ impl TemplateAst {
         unstable_features: &UnstableFeatures,
         jet_hinter: Box<dyn ast::JetHinter>,
     ) -> Result<Self, DiagnosticManager> {
-        Self::new_with_raw_sources(s, unstable_features, jet_hinter, &RawSources::from_disk())
+        Self::new_with_raw_sources(s, unstable_features, jet_hinter, &RawSources::new())
     }
 
     /// Like [`new_with_unstable`](Self::new_with_unstable), obtaining the raw files of `extern fn`
@@ -235,9 +213,10 @@ impl TemplateAst {
             return Err(diagnostics);
         };
 
-        let Some((simfony, loaded_raw)) = Self::analyze_with_raw_sources(
+        let Some((simfony, raw_imports)) = Self::analyze_with_raw_sources(
             &mut resolved_program,
             jet_hinter.as_ref(),
+            &raw_simplicity::RawFiles::new(),
             raw_sources,
             &mut diagnostics,
         ) else {
@@ -250,22 +229,25 @@ impl TemplateAst {
             jet_hinter,
             diagnostics,
             resolved_program,
-            loaded_raw,
+            raw_imports,
         })
     }
 
     /// Give every `extern fn` of `program` its raw code, then analyze it. A raw file that
     /// cannot be loaded is reported and stops before analysis.
+    ///
+    /// `raw_files` holds the files the driver already loaded; the others are read
+    /// through `raw_sources`.
     fn analyze_with_raw_sources(
         program: &mut parse::Program,
         jet_hinter: &dyn ast::JetHinter,
+        raw_files: &raw_simplicity::RawFiles,
         raw_sources: &RawSources,
         diagnostics: &mut DiagnosticManager,
-    ) -> Option<(ast::Program, raw_simplicity::LoadedRaw)> {
-        let sources = diagnostics.sources().cloned();
+    ) -> Option<(ast::Program, Vec<Arc<str>>)> {
         let raw = raw_simplicity::load_raw_code(
             program,
-            sources.as_ref(),
+            raw_files,
             raw_sources,
             jet_hinter.clone_box(),
             diagnostics,
@@ -297,15 +279,10 @@ impl TemplateAst {
         .ok_or(diagnostics)
     }
 
-    /// The raw files the program loaded for its `extern fn` declarations, by key. Compiling the
-    /// same source with them reads nothing from disk.
-    pub fn raw_sources(&self) -> &RawSources {
-        &self.loaded_raw.sources
-    }
-
-    /// The raw entries the program imported: file key, entry and CMR, in declaration order.
-    pub fn raw_imports(&self) -> &[RawImport] {
-        &self.loaded_raw.imports
+    /// The keys ([`RawSources`]) of the raw files the program imported, once each, in
+    /// declaration order.
+    pub fn raw_imports(&self) -> &[Arc<str>] {
+        &self.raw_imports
     }
 
     /// Access the parameters of the program.

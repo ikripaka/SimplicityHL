@@ -9,12 +9,20 @@ use simplicityhl::source::{CanonPath, CanonSourceFile};
 use simplicityhl::value::ValueConstructible;
 use simplicityhl::WitnessNameToValueMap;
 use simplicityhl::{
-    Arguments, CompiledProgram, RawOrigin, RawSources, TemplateProgramWitness, UnstableFeatures,
-    Value, WitnessValues,
+    Arguments, CompiledProgram, RawSources, TemplateProgramWitness, UnstableFeatures, Value,
+    WitnessValues,
 };
 
 const DECL: &str = "#[path = \"equal32.simpl\"] extern fn raw_equal32(a: u32, b: u32) -> bool;";
 const RAW: &str = "export := jet_eq_32 : (2^32 * 2^32) -> 2\n";
+
+/// The given texts of raw files, by key.
+fn given(files: &[(&str, &str)]) -> RawSources {
+    files
+        .iter()
+        .map(|(key, text)| (Arc::from(*key), Arc::from(*text)))
+        .collect()
+}
 
 fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("raw-simplicity-{name}"));
@@ -143,7 +151,7 @@ fn structured_signature_mismatches() {
 
         assert_eq!(
             origin,
-            &RawOrigin::Extern(root.join("equal32.simpl").canonicalize().unwrap().into())
+            &Arc::<Path>::from(root.join("equal32.simpl").canonicalize().unwrap())
         );
         assert_eq!(entry, "export");
 
@@ -490,7 +498,7 @@ fn extern_functions_work_as_fold_and_loop_callbacks() {
             assert!(jet::eq_32(unwrap_left::<u32>(loop_result), 7));
         }
     "#;
-    let raw_sources = RawSources::from_iter([
+    let raw_sources = given(&[
         ("add.simpl", "export := comp jet_add_32 (drop iden)"),
         (
             "step.simpl",
@@ -682,31 +690,21 @@ fn flatten_preserves_raw_paths_from_imported_modules() {
     let deps = DependencyMapBuilder::new()
         .build(CanonPath::canonicalize(&root).unwrap())
         .unwrap();
-    let (flat, raw_deps) = simplicityhl::TemplateAst::flatten_with_raw_dependencies(
-        source,
-        &deps,
-        &UnstableFeatures::all(),
-    )
-    .unwrap();
+    let flat = simplicityhl::TemplateAst::flatten(source, &deps, &UnstableFeatures::all()).unwrap();
 
     // The path is relative to the entry file, not absolute.
     assert!(flat.contains(r#"path = "nested/equal32.simpl""#), "{flat}");
     assert!(!flat.contains(root.to_str().unwrap()), "{flat}");
-    assert_eq!(raw_deps.len(), 1);
-    assert_eq!(&*raw_deps[0].path, "nested/equal32.simpl");
-    assert_eq!(
-        raw_deps[0].file,
-        root.join("nested/equal32.simpl").canonicalize().unwrap()
-    );
+    let keys =
+        simplicityhl::TemplateAst::declared_raw_paths(&flat, &UnstableFeatures::all()).unwrap();
+    assert_eq!(keys, [Arc::from("nested/equal32.simpl")]);
 
     // The flattened source compiles from the files given by key, as does the original.
-    let given: RawSources = raw_deps
+    let given: RawSources = keys
         .iter()
-        .map(|dep| {
-            (
-                dep.path.clone(),
-                std::fs::read_to_string(&dep.file).unwrap(),
-            )
+        .map(|key| {
+            let text = std::fs::read_to_string(root.join(key.as_ref())).unwrap();
+            (Arc::clone(key), Arc::from(text))
         })
         .collect();
 
@@ -753,32 +751,24 @@ fn raw_sources_are_provided_and_reported() {
             .collect::<Vec<_>>(),
         ["equal32.simpl"]
     );
-    let given: RawSources = [("equal32.simpl", RAW)].into_iter().collect();
-
     let template = simplicityhl::TemplateAst::new_with_raw_sources(
         source.as_str(),
         &UnstableFeatures::all(),
         Box::new(ElementsJetHinter::new()),
-        &given,
+        &given(&[("equal32.simpl", RAW)]),
     )
     .unwrap();
-    assert_eq!(template.raw_sources(), &given);
-
-    let expected_cmr = simplicity::jet::Jet::cmr(&simplicity::jet::Elements::Eq32);
-    let imports = template.raw_imports();
-    assert_eq!(imports.len(), 1);
-    assert_eq!(
-        (&*imports[0].path, &*imports[0].entry),
-        ("equal32.simpl", "export")
-    );
-    assert_eq!(imports[0].cmr, expected_cmr);
+    assert_eq!(template.raw_imports(), [Arc::from("equal32.simpl")]);
 
     // A file-based compilation reads from disk by default, and reports the file by key.
     let root = project(
         "raw-sources-reported",
         &[("main.simf", &source), ("equal32.simpl", RAW)],
     );
-    assert_eq!(analyze(&root).unwrap().raw_sources(), &given);
+    assert_eq!(
+        analyze(&root).unwrap().raw_imports(),
+        [Arc::from("equal32.simpl")]
+    );
 }
 
 #[test]
@@ -811,18 +801,12 @@ fn given_raw_sources_replace_the_file_system() {
         )
     };
     assert!(analyze(&root).is_err(), "the file on disk mismatches");
-    assert!(analyze_with(&[("equal32.simpl", RAW)].into_iter().collect()).is_ok());
+    assert!(analyze_with(&given(&[("equal32.simpl", RAW)])).is_ok());
     // A key that is not given is read from disk.
     assert!(
         analyze_with(&RawSources::new()).is_err(),
         "the file on disk is read"
     );
-
-    // A key can name another file on disk instead.
-    let elsewhere = project("raw-sources-given-elsewhere", &[("equal32.simpl", RAW)]);
-    let mut given = RawSources::new();
-    given.insert_file("equal32.simpl", elsewhere.join("equal32.simpl"));
-    assert!(analyze_with(&given).is_ok());
 }
 
 #[test]
@@ -853,21 +837,20 @@ fn given_texts_and_files_on_disk_can_be_mixed() {
     let deps = DependencyMapBuilder::new()
         .build(CanonPath::canonicalize(&root).unwrap())
         .unwrap();
-    let given: RawSources = [("equal32.simpl", RAW)].into_iter().collect();
     let template = simplicityhl::TemplateAst::new_with_dep_and_raw_sources(
         source,
         &deps,
         &UnstableFeatures::all(),
         Box::new(ElementsJetHinter::new()),
-        &given,
+        &given(&[("equal32.simpl", RAW)]),
     )
     .unwrap();
 
-    // Both texts are reported, so the program can be compiled again from them alone.
-    let loaded: RawSources = [("equal32.simpl", RAW), ("identity.simpl", identity)]
-        .into_iter()
-        .collect();
-    assert_eq!(template.raw_sources(), &loaded);
+    // Both files are reported, the given one and the one read from disk.
+    assert_eq!(
+        template.raw_imports(),
+        [Arc::from("equal32.simpl"), Arc::from("identity.simpl")]
+    );
     template.instantiate(Arguments::default(), false).unwrap();
 }
 
@@ -886,7 +869,7 @@ fn raw_keys_of_files_are_resolved_by_the_file_system() {
     );
 
     let template = analyze(&root).unwrap();
-    assert_eq!(&*template.raw_imports()[0].path, "equal32.simpl");
+    assert_eq!(template.raw_imports(), [Arc::from("equal32.simpl")]);
 }
 
 #[test]
@@ -941,7 +924,7 @@ fn parsing_uses_the_selected_jet_set() {
         extern fn index() -> u32;
         fn main() {}
     "#;
-    let raw_sources = RawSources::from_iter([("index.simpl", "export := jet_current_index")]);
+    let raw_sources = given(&[("index.simpl", "export := jet_current_index")]);
     let features = UnstableFeatures::all();
 
     TemplateAst::new_with_raw_sources(source, &features, Box::new(ElementsJetHinter), &raw_sources)

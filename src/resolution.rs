@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::driver::CRATE_STR;
@@ -240,6 +241,17 @@ pub(crate) struct ResolvedUse {
     pub(crate) mod_path: Vec<Identifier>,
 }
 
+/// Represents a fully resolved `extern fn` declaration: the raw Simplicity file it names.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedRaw {
+    /// The resolved `.simpl` file.
+    pub(crate) path: CanonPath,
+
+    /// The key of the file ([`crate::RawSources`]): its path relative to the project root,
+    /// which the flattened program names it by.
+    pub(crate) key: Arc<str>,
+}
+
 impl DependencyMap {
     /// Returns the package root for the given file, which corresponds to the
     /// target directory of the most specific dependency or the entry root.
@@ -257,6 +269,58 @@ impl DependencyMap {
         use_decl: &UseDecl,
     ) -> Result<CanonPath, Diagnostic> {
         Ok(self.resolve_path_internal(current_file, use_decl)?.path)
+    }
+
+    /// Resolve the `path` of an `extern fn` declared in `current_file` into a physical file,
+    /// and key it by its path relative to `project_root`, the package root of the entry file.
+    ///
+    /// The path is relative to the directory of `current_file`. Like the file of a `use`, the
+    /// resolved file must lie inside the package that owns `current_file`. It must also lie
+    /// inside `project_root`, so that its key is a plain relative path: a dependency package
+    /// outside the project cannot provide raw files.
+    pub(crate) fn resolve_raw_path(
+        &self,
+        current_file: &CanonPath,
+        project_root: &CanonPath,
+        path: &str,
+    ) -> Result<ResolvedRaw, Error> {
+        let raw_error = |msg: String| Error::Simplicity { msg };
+
+        let candidate = current_file
+            .as_path()
+            .parent()
+            .unwrap_or(Path::new(""))
+            .join(path);
+        let resolved = std::fs::canonicalize(&candidate)
+            .and_then(|path| CanonPath::canonicalize(&path).map_err(std::io::Error::other))
+            .map_err(|e| raw_error(format!("cannot read {}: {e}", candidate.display())))?;
+
+        if let Some(root) = self.get_package_root(current_file) {
+            if !resolved.starts_with(root) {
+                return Err(raw_error(format!(
+                    "the external path `{path}` leaves the package {}",
+                    root.as_path().display()
+                )));
+            }
+        }
+
+        let key = resolved
+            .as_path()
+            .strip_prefix(project_root.as_path())
+            .map_err(|_| {
+                raw_error(format!(
+                    "the external path `{path}` lies outside the project {}",
+                    project_root.as_path().display()
+                ))
+            })?
+            .to_str()
+            .ok_or_else(|| raw_error(format!("the external path `{path}` is not valid UTF-8")))?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+
+        Ok(ResolvedRaw {
+            path: resolved,
+            key: Arc::from(key),
+        })
     }
 
     pub(crate) fn resolve_path_internal(
